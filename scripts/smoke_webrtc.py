@@ -77,7 +77,7 @@ def main() -> int:
 
     def on_pad_added(_peer, pad) -> None:
         receiver = Gst.parse_bin_from_description(
-            "rtph264depay ! h264parse ! avdec_h264 ! fakesink name=sink sync=false signal-handoffs=true",
+            "rtpvp8depay ! vp8dec ! fakesink name=sink sync=false signal-handoffs=true",
             True,
         )
         pipeline.add(receiver)
@@ -119,7 +119,7 @@ def main() -> int:
     peer.connect("on-ice-candidate", on_ice)
     peer.connect("pad-added", on_pad_added)
     caps = Gst.Caps.from_string(
-        "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000,packetization-mode=(string)1"
+        "application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000"
     )
     peer.emit("add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, caps)
     pipeline.set_state(Gst.State.PLAYING)
@@ -154,7 +154,7 @@ def main() -> int:
         raise RuntimeError(failed[0])
     if not received_frame.is_set():
         raise TimeoutError("no decoded WebRTC desktop frame arrived within 15 seconds")
-    print("ok: WebRTC negotiated, H.264 desktop frame decoded, DataChannel opened")
+    print("ok: WebRTC negotiated, VP8 desktop frame decoded, DataChannel opened")
     return 0
 
 

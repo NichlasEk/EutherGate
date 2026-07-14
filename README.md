@@ -11,7 +11,7 @@ The first two checkpoints form a usable vertical slice:
 - resize support and a bounded output replay buffer;
 - a small health/status API for automation.
 - a real headless Hyprland output created on demand;
-- H.264 desktop video transported with WebRTC;
+- VP8 desktop video transported with WebRTC;
 - pointer, keyboard and wheel events over a WebRTC DataChannel;
 - a browser switcher between Gate Shell and Remote Forge.
 
@@ -20,7 +20,7 @@ The first two checkpoints form a usable vertical slice:
 Requirements: Rust, Node.js and npm.
 
 Remote Forge additionally needs an active Hyprland session, `grim`, Python with
-PyGObject and `websockets`, and the GStreamer WebRTC, OpenH264 and libav plugins.
+PyGObject and `websockets`, and the GStreamer WebRTC and VP8 plugins.
 On Arch Linux these are supplied by `gstreamer`, `gst-plugins-bad`,
 `gst-plugins-good`, `gst-libav`, `gst-python`, `python-websockets` and `grim`.
 
@@ -74,7 +74,7 @@ Hyprland session:
 EUTHERGATE_TOKEN=your-token python scripts/smoke_webrtc.py
 ```
 
-It starts the virtual output, negotiates WebRTC, decodes a real H.264 desktop
+It starts the virtual output, negotiates WebRTC, decodes a real VP8 desktop
 frame, opens the DataChannel and sends a pointer event.
 
 For frontend work, run the gateway and Vite separately:

@@ -442,7 +442,7 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         output: desktop.output.clone(),
         mode: desktop.mode.clone(),
         workspace: desktop.workspace.load(Ordering::Acquire),
-        transport: "WebRTC/H.264",
+        transport: "WebRTC/VP8",
         input: "WebRTC DataChannel",
     })
     .into_response()

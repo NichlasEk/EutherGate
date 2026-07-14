@@ -31,6 +31,8 @@ let fitAddon: FitAddon | null = null;
 let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
+let desktopVideoReady = false;
+let desktopNegotiationTimer: number | null = null;
 
 function gateShell(content: string): string {
   return `
@@ -148,7 +150,7 @@ async function renderDesktop(): Promise<void> {
         </div>
         <div class="stream-hud">
           <span id="desktop-output">EUTHERGATE-1</span>
-          <span>H.264 / DATACHANNEL</span>
+          <span id="desktop-transport">VP8 / DATACHANNEL</span>
         </div>
       </div>
       <div class="desktop-footer">
@@ -185,6 +187,8 @@ function updateDesktopStatus(status: DesktopStatus): void {
   if (output) output.textContent = `${status.output} / WS ${status.workspace}`;
   const mode = document.querySelector<HTMLElement>("#desktop-mode");
   if (mode) mode.textContent = status.mode.replace("x", "×").replace("@", " @ ");
+  const transport = document.querySelector<HTMLElement>("#desktop-transport");
+  if (transport) transport.textContent = `${status.transport.replace("WebRTC/", "")} / DATACHANNEL`;
   setDesktopState(status.active ? "NEGOTIATING" : "OFFLINE");
 }
 
@@ -220,17 +224,23 @@ function connectDesktop(): void {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   socket = new WebSocket(`${protocol}//${location.host}/ws/desktop`);
   remoteCandidates = [];
+  desktopVideoReady = false;
   setDesktopState("NEGOTIATING");
 
   peer = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
   peer.addTransceiver("video", { direction: "recvonly" });
   inputChannel = peer.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
-  inputChannel.addEventListener("open", () => setDesktopState("LIVE"));
+  inputChannel.addEventListener("open", () => setDesktopState(desktopVideoReady ? "LIVE" : "WAITING FOR VIDEO"));
   inputChannel.addEventListener("close", () => setDesktopState("VIDEO ONLY"));
   peer.addEventListener("track", (event) => {
     const video = document.querySelector<HTMLVideoElement>("#desktop-video");
-    if (video) video.srcObject = event.streams[0] || new MediaStream([event.track]);
-    hideDesktopMessage();
+    if (!video) return;
+    video.srcObject = event.streams[0] || new MediaStream([event.track]);
+    video.addEventListener("playing", markDesktopVideoReady, { once: true });
+    void video.play().catch((error: unknown) => {
+      setDesktopState("PLAYBACK BLOCKED");
+      showDesktopMessage(error instanceof Error ? error.message : "Browser blocked video playback.");
+    });
   });
   peer.addEventListener("icecandidate", (event) => {
     if (event.candidate && socket?.readyState === WebSocket.OPEN) {
@@ -238,7 +248,9 @@ function connectDesktop(): void {
     }
   });
   peer.addEventListener("connectionstatechange", () => {
-    if (peer?.connectionState === "connected") setDesktopState(inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
+    if (peer?.connectionState === "connected") {
+      setDesktopState(desktopVideoReady ? (inputChannel?.readyState === "open" ? "LIVE" : "VIDEO") : "WAITING FOR VIDEO");
+    }
     if (["failed", "disconnected", "closed"].includes(peer?.connectionState || "")) setDesktopState("RECONNECTING");
   });
 
@@ -247,10 +259,19 @@ function connectDesktop(): void {
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
     socket.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+    desktopNegotiationTimer = window.setTimeout(() => {
+      if (!desktopVideoReady) {
+        setDesktopState("NO VIDEO");
+        showDesktopMessage("WebRTC connected without a video track. Reload and try again.");
+      }
+    }, 8000);
   });
   socket.addEventListener("message", async (event) => {
     const message = JSON.parse(String(event.data)) as Record<string, unknown>;
-    if (message.type === "answer" && peer) {
+    if (message.type === "ready") {
+      const transport = document.querySelector<HTMLElement>("#desktop-transport");
+      if (transport) transport.textContent = `${String(message.codec)} / DATACHANNEL`;
+    } else if (message.type === "answer" && peer) {
       await peer.setRemoteDescription({ type: "answer", sdp: String(message.sdp) });
       for (const candidate of remoteCandidates) await peer.addIceCandidate(candidate);
       remoteCandidates = [];
@@ -268,6 +289,14 @@ function connectDesktop(): void {
   socket.addEventListener("close", () => {
     if (peer) setDesktopState("DISCONNECTED");
   });
+}
+
+function markDesktopVideoReady(): void {
+  desktopVideoReady = true;
+  if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
+  desktopNegotiationTimer = null;
+  hideDesktopMessage();
+  setDesktopState(inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
 }
 
 function installDesktopInput(): void {
@@ -318,7 +347,7 @@ function desktopKeyEvent(event: KeyboardEvent): void {
 }
 
 function sendDesktopInput(message: Record<string, unknown>): void {
-  if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(message));
+  if (desktopVideoReady && inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(message));
 }
 
 function setDesktopState(value: string): void {
@@ -443,6 +472,9 @@ function disposeDesktop(): void {
     socket = null;
   }
   remoteCandidates = [];
+  desktopVideoReady = false;
+  if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
+  desktopNegotiationTimer = null;
 }
 
 function escapeHtml(value: string): string {

@@ -67,12 +67,10 @@ class DesktopBridge:
                 caps=video/x-raw,format=RGB,width={width},height={height},framerate={fps}/1 !
             queue leaky=downstream max-size-buffers=1 !
             videoconvert n-threads=2 !
-            openh264enc usage-type=screen complexity=low rate-control=bitrate
-                bitrate=5000000 max-bitrate=6500000 enable-frame-skip=true
-                gop-size={fps * 2} multi-thread=2 !
-            h264parse config-interval=-1 !
-            rtph264pay config-interval=-1 aggregate-mode=zero-latency pt=96 !
-            application/x-rtp,media=video,encoding-name=H264,payload=96 !
+            vp8enc deadline=1 cpu-used=8 end-usage=cbr target-bitrate=5000000
+                keyframe-max-dist={fps * 2} lag-in-frames=0 threads=4 !
+            rtpvp8pay picture-id-mode=15-bit pt=96 !
+            application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96 !
             webrtcbin name=webrtc bundle-policy=max-bundle latency=30
         """
         return Gst.parse_launch(" ".join(description.split()))
@@ -87,7 +85,7 @@ class DesktopBridge:
         ]
         for thread in threads:
             thread.start()
-        emit({"type": "ready", "output": self.output, "codec": "H264", "input": "datachannel"})
+        emit({"type": "ready", "output": self.output, "codec": "VP8", "input": "datachannel"})
         try:
             self.loop.run()
         finally:
@@ -354,7 +352,7 @@ def main() -> int:
     Gst.init(None)
     bridge = DesktopBridge(args.output, mode)
     if args.probe:
-        print("ok: GStreamer WebRTC/H.264 pipeline is available")
+        print("ok: GStreamer WebRTC/VP8 pipeline is available")
         bridge.pipeline.set_state(Gst.State.NULL)
         return 0
 

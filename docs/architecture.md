@@ -57,7 +57,7 @@ Short-lived, session-scoped credentials should connect the two.
 ## Checkpoint 2: Remote Forge
 
 ```text
-Browser <-------- WebRTC H.264 -------- GStreamer webrtcbin
+Browser <--------- WebRTC VP8 --------- GStreamer webrtcbin
    |                                      ^
    +---- WebRTC DataChannel input ------->| Hyprland IPC
                                           |
@@ -76,12 +76,12 @@ EutherGate owns creation and removal of the headless output. The output and its
 applications survive browser WebSocket/WebRTC reconnects; only the media helper
 is replaced. One viewer is permitted at a time in this checkpoint.
 
-GStreamer handles SDP, ICE, DTLS, SRTP, H.264 RTP and SCTP DataChannel traffic.
+GStreamer handles SDP, ICE, DTLS, SRTP, VP8 RTP and SCTP DataChannel traffic.
 The Rust gateway only relays authenticated signaling messages, keeping media off
 the HTTP control plane.
 
 The current capture loop intentionally favors a verifiable end-to-end path over
 performance. Each frame is fetched with `grim` and pushed into an `appsrc` before
-OpenH264 encoding. The next media checkpoint keeps the same WebRTC contract but
+VP8 encoding. The next media checkpoint keeps the same WebRTC contract but
 uses persistent wlroots screencopy buffers and GPU-backed encoding where
 available.

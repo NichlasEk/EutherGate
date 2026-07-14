@@ -57,7 +57,7 @@ if ! python -c 'import websockets' >/dev/null 2>&1; then
     desktop_notes+=("missing Python websockets package")
 fi
 
-for plugin in webrtcbin openh264enc; do
+for plugin in webrtcbin vp8enc; do
     if ! gst-inspect-1.0 "$plugin" >/dev/null 2>&1; then
         desktop_ready=false
         desktop_notes+=("missing GStreamer plugin $plugin")
