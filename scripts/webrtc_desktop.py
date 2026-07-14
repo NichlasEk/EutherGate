@@ -184,7 +184,7 @@ class DesktopBridge:
         while self.running.is_set():
             try:
                 capture = subprocess.run(
-                    ["grim", "-o", self.output, "-t", "ppm", "-"],
+                    ["grim", "-c", "-o", self.output, "-t", "ppm", "-"],
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
