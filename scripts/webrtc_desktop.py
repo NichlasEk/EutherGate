@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -54,6 +55,7 @@ class DesktopBridge:
         self.running = threading.Event()
         self.running.set()
         self.input_events: queue.Queue[dict] = queue.Queue(maxsize=256)
+        self.media_ready = threading.Event()
         self.pipeline = self._build_pipeline()
         self.source = self.pipeline.get_by_name("source")
         self.webrtc = self.pipeline.get_by_name("webrtc")
@@ -69,8 +71,7 @@ class DesktopBridge:
             videoconvert n-threads=2 !
             vp8enc deadline=1 cpu-used=8 end-usage=cbr target-bitrate=5000000
                 keyframe-max-dist={fps * 2} lag-in-frames=0 threads=4 !
-            rtpvp8pay picture-id-mode=15-bit pt=96 !
-            application/x-rtp,media=video,encoding-name=VP8,clock-rate=90000,payload=96 !
+            rtpvp8pay name=payloader picture-id-mode=15-bit pt=96 !
             webrtcbin name=webrtc bundle-policy=max-bundle latency=30
         """
         return Gst.parse_launch(" ".join(description.split()))
@@ -120,6 +121,12 @@ class DesktopBridge:
         self.stop()
 
     def _accept_offer(self, sdp_text: str) -> bool:
+        payload = offered_video_payload(sdp_text, "VP8")
+        if payload is None:
+            emit({"type": "error", "message": "Browser offer contains no VP8 video codec"})
+            return False
+        self.pipeline.get_by_name("payloader").set_property("pt", payload)
+        emit({"type": "offer-info", "codec": "VP8", "payload": payload})
         result, sdp = GstSdp.SDPMessage.new()
         if result != GstSdp.SDPResult.OK:
             raise RuntimeError("could not allocate SDP message")
@@ -138,6 +145,7 @@ class DesktopBridge:
         answer = reply.get_value("answer")
         webrtc.emit("set-local-description", answer, Gst.Promise.new())
         emit({"type": "answer", "sdp": answer.sdp.as_text()})
+        self.media_ready.set()
 
     def _on_ice_candidate(self, _webrtc, mline_index: int, candidate: str) -> None:
         emit({"type": "ice", "candidate": candidate, "sdpMLineIndex": mline_index})
@@ -164,6 +172,8 @@ class DesktopBridge:
         frame_duration = Gst.SECOND // self.mode.fps
         frame = 0
         next_frame = time.monotonic()
+        while self.running.is_set() and not self.media_ready.wait(0.25):
+            pass
         while self.running.is_set():
             try:
                 capture = subprocess.run(
@@ -247,6 +257,15 @@ def parse_ppm(data: bytes, mode: Mode) -> bytes:
     if len(pixels) != expected:
         raise ValueError(f"grim returned {len(pixels)} RGB bytes; expected {expected}")
     return pixels
+
+
+def offered_video_payload(sdp: str, codec: str) -> int | None:
+    sections = re.split(r"(?=^m=)", sdp.replace("\r\n", "\n"), flags=re.MULTILINE)
+    video = next((section for section in sections if section.startswith("m=video ")), None)
+    if video is None:
+        return None
+    match = re.search(rf"^a=rtpmap:(\d+)\s+{re.escape(codec)}/90000\s*$", video, re.IGNORECASE | re.MULTILINE)
+    return int(match.group(1)) if match else None
 
 
 def output_geometry(output: str) -> tuple[int, int]:

@@ -119,7 +119,7 @@ def main() -> int:
     peer.connect("on-ice-candidate", on_ice)
     peer.connect("pad-added", on_pad_added)
     caps = Gst.Caps.from_string(
-        "application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000"
+        "application/x-rtp,media=video,encoding-name=VP8,payload=120,clock-rate=90000"
     )
     peer.emit("add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, caps)
     pipeline.set_state(Gst.State.PLAYING)
