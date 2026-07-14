@@ -24,6 +24,21 @@ PyGObject and `websockets`, and the GStreamer WebRTC, OpenH264 and libav plugins
 On Arch Linux these are supplied by `gstreamer`, `gst-plugins-bad`,
 `gst-plugins-good`, `gst-libav`, `gst-python`, `python-websockets` and `grim`.
 
+The easy path checks the environment, creates a private token on first run,
+builds the web UI and starts the gateway:
+
+```bash
+./start.sh
+```
+
+To only inspect requirements without starting anything:
+
+```bash
+./start.sh --check
+```
+
+The manual equivalent is documented below.
+
 ```bash
 cp .env.example .env
 npm --prefix web install
