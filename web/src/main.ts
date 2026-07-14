@@ -302,7 +302,9 @@ function connectDesktop(): void {
 
   peer = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
   peer.addTransceiver("video", { direction: "recvonly" });
-  inputChannel = peer.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
+  // Position must arrive before its click, and modifiers before their key.
+  // SCTP's reliable ordered mode is still independent of the video stream.
+  inputChannel = peer.createDataChannel("input", { ordered: true });
   inputChannel.addEventListener("open", () => setDesktopState(desktopVideoReady ? "LIVE" : "WAITING FOR VIDEO"));
   inputChannel.addEventListener("close", () => setDesktopState("VIDEO ONLY"));
   peer.addEventListener("track", (event) => {

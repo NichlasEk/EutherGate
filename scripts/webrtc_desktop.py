@@ -168,7 +168,7 @@ class DesktopBridge:
                 try:
                     self.input_events.put_nowait(event)
                 except queue.Full:
-                    if event.get("type") == "pointer_move":
+                    if event.get("type") in ("pointer_move", "pointer_delta"):
                         return
                     self.input_events.get_nowait()
                     self.input_events.put_nowait(event)
@@ -208,10 +208,25 @@ class DesktopBridge:
 
     def _input_loop(self) -> None:
         controller = InputController(self.output, self.mode)
+        deferred: dict | None = None
         while self.running.is_set():
             try:
-                event = self.input_events.get(timeout=0.5)
-                controller.inject(event)
+                event = deferred or self.input_events.get(timeout=0.5)
+                deferred = None
+                if event.get("type") in ("pointer_move", "pointer_delta"):
+                    controller.update_pointer(event)
+                    while True:
+                        try:
+                            following = self.input_events.get_nowait()
+                        except queue.Empty:
+                            break
+                        if following.get("type") not in ("pointer_move", "pointer_delta"):
+                            deferred = following
+                            break
+                        controller.update_pointer(following)
+                    controller.flush_pointer()
+                else:
+                    controller.inject(event)
             except queue.Empty:
                 continue
             except Exception as error:
@@ -305,13 +320,11 @@ class InputController:
                 str(self.return_position[1]),
             )
         elif kind == "pointer_move":
-            self.remote_x = float(event["x"])
-            self.remote_y = float(event["y"])
-            self._move_pointer()
+            self.update_pointer(event)
+            self.flush_pointer()
         elif kind == "pointer_delta":
-            self.remote_x += float(event.get("dx", 0))
-            self.remote_y += float(event.get("dy", 0))
-            self._move_pointer()
+            self.update_pointer(event)
+            self.flush_pointer()
         elif kind == "pointer_button" and event.get("state") == "pressed":
             button = {0: 272, 1: 274, 2: 273}.get(int(event.get("button", 0)))
             if button:
@@ -334,7 +347,15 @@ class InputController:
                 modifiers.append("SUPER")
             run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
 
-    def _move_pointer(self) -> None:
+    def update_pointer(self, event: dict) -> None:
+        if event.get("type") == "pointer_move":
+            self.remote_x = float(event["x"])
+            self.remote_y = float(event["y"])
+        else:
+            self.remote_x += float(event.get("dx", 0))
+            self.remote_y += float(event.get("dy", 0))
+
+    def flush_pointer(self) -> None:
         self.remote_x = max(0, min(self.mode.width - 1, self.remote_x))
         self.remote_y = max(0, min(self.mode.height - 1, self.remote_y))
         x = self.geometry[0] + round(self.remote_x)
