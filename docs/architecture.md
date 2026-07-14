@@ -67,14 +67,17 @@ Browser <--------- WebRTC VP8 --------- GStreamer webrtcbin
                                grim / wlroots screencopy
                                           ^
                                           |
-                           Hyprland EUTHERGATE-1 headless output
+                      selected Hyprland physical/headless output
                                           |
                                native Wayland applications
 ```
 
-EutherGate owns creation and removal of the headless output. The output and its
-applications survive browser WebSocket/WebRTC reconnects; only the media helper
-is replaced. One viewer is permitted at a time in this checkpoint.
+The viewer can capture an existing physical output or EutherGate's own headless
+output. EutherGate only creates and removes the latter. Output applications
+survive browser WebSocket/WebRTC reconnects; only the media helper is replaced.
+One viewer is permitted at a time in this checkpoint. Clicking the stream
+enters relative pointer control and Esc releases it and restores the original
+host cursor position.
 
 GStreamer handles SDP, ICE, DTLS, SRTP, VP8 RTP and SCTP DataChannel traffic.
 The Rust gateway only relays authenticated signaling messages, keeping media off

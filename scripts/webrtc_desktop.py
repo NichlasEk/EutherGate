@@ -152,7 +152,14 @@ class DesktopBridge:
 
     def _on_data_channel(self, _webrtc, channel) -> None:
         channel.connect("on-message-string", self._on_data_message)
+        channel.connect("on-close", lambda *_: self._queue_release_control())
         emit({"type": "input-ready", "label": channel.get_property("label")})
+
+    def _queue_release_control(self) -> None:
+        try:
+            self.input_events.put_nowait({"type": "release_control"})
+        except queue.Full:
+            pass
 
     def _on_data_message(self, _channel, payload: str) -> None:
         try:
@@ -200,11 +207,11 @@ class DesktopBridge:
             time.sleep(max(0, next_frame - time.monotonic()))
 
     def _input_loop(self) -> None:
-        geometry = output_geometry(self.output)
+        controller = InputController(self.output, self.mode)
         while self.running.is_set():
             try:
                 event = self.input_events.get(timeout=0.5)
-                inject_input(event, geometry, self.mode)
+                controller.inject(event)
             except queue.Empty:
                 continue
             except Exception as error:
@@ -280,33 +287,71 @@ def output_geometry(output: str) -> tuple[int, int]:
     return int(monitor["x"]), int(monitor["y"])
 
 
-def inject_input(event: dict, geometry: tuple[int, int], mode: Mode) -> None:
-    kind = event.get("type")
-    if kind == "pointer_move":
-        x = geometry[0] + max(0, min(mode.width - 1, round(float(event["x"]))))
-        y = geometry[1] + max(0, min(mode.height - 1, round(float(event["y"]))))
+class InputController:
+    def __init__(self, output: str, mode: Mode) -> None:
+        self.geometry = output_geometry(output)
+        self.mode = mode
+        self.return_position = cursor_position()
+        self.remote_x = mode.width / 2
+        self.remote_y = mode.height / 2
+
+    def inject(self, event: dict) -> None:
+        kind = event.get("type")
+        if kind == "release_control":
+            run_hyprctl(
+                "dispatch",
+                "movecursor",
+                str(self.return_position[0]),
+                str(self.return_position[1]),
+            )
+        elif kind == "pointer_move":
+            self.remote_x = float(event["x"])
+            self.remote_y = float(event["y"])
+            self._move_pointer()
+        elif kind == "pointer_delta":
+            self.remote_x += float(event.get("dx", 0))
+            self.remote_y += float(event.get("dy", 0))
+            self._move_pointer()
+        elif kind == "pointer_button" and event.get("state") == "pressed":
+            button = {0: 272, 1: 274, 2: 273}.get(int(event.get("button", 0)))
+            if button:
+                run_hyprctl("dispatch", "sendshortcut", f",mouse:{button}")
+        elif kind == "wheel":
+            key = "pagedown" if float(event.get("dy", 0)) > 0 else "pageup"
+            run_hyprctl("dispatch", "sendshortcut", f",{key}")
+        elif kind == "key" and event.get("state") == "pressed" and not event.get("repeat"):
+            key = browser_key(event.get("code", ""))
+            if not key:
+                return
+            modifiers = []
+            if event.get("ctrl"):
+                modifiers.append("CTRL")
+            if event.get("alt"):
+                modifiers.append("ALT")
+            if event.get("shift"):
+                modifiers.append("SHIFT")
+            if event.get("meta"):
+                modifiers.append("SUPER")
+            run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
+
+    def _move_pointer(self) -> None:
+        self.remote_x = max(0, min(self.mode.width - 1, self.remote_x))
+        self.remote_y = max(0, min(self.mode.height - 1, self.remote_y))
+        x = self.geometry[0] + round(self.remote_x)
+        y = self.geometry[1] + round(self.remote_y)
         run_hyprctl("dispatch", "movecursor", str(x), str(y))
-    elif kind == "pointer_button" and event.get("state") == "pressed":
-        button = {0: 272, 1: 274, 2: 273}.get(int(event.get("button", 0)))
-        if button:
-            run_hyprctl("dispatch", "sendshortcut", f",mouse:{button}")
-    elif kind == "wheel":
-        key = "pagedown" if float(event.get("dy", 0)) > 0 else "pageup"
-        run_hyprctl("dispatch", "sendshortcut", f",{key}")
-    elif kind == "key" and event.get("state") == "pressed" and not event.get("repeat"):
-        key = browser_key(event.get("code", ""))
-        if not key:
-            return
-        modifiers = []
-        if event.get("ctrl"):
-            modifiers.append("CTRL")
-        if event.get("alt"):
-            modifiers.append("ALT")
-        if event.get("shift"):
-            modifiers.append("SHIFT")
-        if event.get("meta"):
-            modifiers.append("SUPER")
-        run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
+
+
+def cursor_position() -> tuple[int, int]:
+    result = subprocess.run(
+        ["hyprctl", "cursorpos"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=1,
+    )
+    x, y = result.stdout.strip().split(",", 1)
+    return int(float(x.strip())), int(float(y.strip()))
 
 
 def browser_key(code: str) -> str | None:

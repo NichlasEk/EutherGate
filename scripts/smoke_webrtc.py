@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import urllib.request
+import urllib.parse
 
 import gi
 import websockets.sync.client
@@ -18,6 +19,7 @@ from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
 HTTP_BASE = os.environ.get("EUTHERGATE_SMOKE_URL", "http://127.0.0.1:8787")
 TOKEN = os.environ.get("EUTHERGATE_TOKEN", "")
+OUTPUT = os.environ.get("EUTHERGATE_SMOKE_OUTPUT", "")
 
 
 def login() -> str:
@@ -34,8 +36,9 @@ def login() -> str:
 
 
 def start_desktop(cookie: str) -> None:
+    query = f"?output={urllib.parse.quote(OUTPUT)}" if OUTPUT else ""
     request = urllib.request.Request(
-        f"{HTTP_BASE}/api/desktop/start",
+        f"{HTTP_BASE}/api/desktop/start{query}",
         headers={"cookie": cookie},
         method="POST",
     )

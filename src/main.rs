@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     process::Stdio,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -61,10 +61,18 @@ struct DesktopManager {
     transition: Mutex<()>,
     active: AtomicBool,
     viewer_connected: AtomicBool,
+    headless_output: String,
+    headless_mode: String,
+    selection: StdMutex<DesktopSelection>,
+    helper: PathBuf,
+}
+
+#[derive(Clone)]
+struct DesktopSelection {
     output: String,
     mode: String,
-    workspace: AtomicU32,
-    helper: PathBuf,
+    workspace: u32,
+    virtual_output: bool,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +96,40 @@ struct DesktopStatusResponse {
     workspace: u32,
     transport: &'static str,
     input: &'static str,
+    virtual_output: bool,
+    outputs: Vec<DesktopOutput>,
+}
+
+#[derive(Clone, Serialize)]
+struct DesktopOutput {
+    name: String,
+    description: String,
+    mode: String,
+    workspace: u32,
+    virtual_output: bool,
+}
+
+#[derive(Deserialize)]
+struct DesktopStartQuery {
+    output: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HyprMonitor {
+    name: String,
+    #[serde(default)]
+    description: String,
+    width: u32,
+    height: u32,
+    #[serde(rename = "refreshRate")]
+    refresh_rate: f64,
+    #[serde(rename = "activeWorkspace")]
+    active_workspace: HyprWorkspace,
+}
+
+#[derive(Deserialize)]
+struct HyprWorkspace {
+    id: u32,
 }
 
 #[derive(Deserialize)]
@@ -116,9 +158,14 @@ async fn main() -> Result<()> {
             transition: Mutex::new(()),
             active: AtomicBool::new(false),
             viewer_connected: AtomicBool::new(false),
-            output: config.desktop_output.clone(),
-            mode: config.desktop_mode.clone(),
-            workspace: AtomicU32::new(0),
+            headless_output: config.desktop_output.clone(),
+            headless_mode: config.desktop_mode.clone(),
+            selection: StdMutex::new(DesktopSelection {
+                output: config.desktop_output.clone(),
+                mode: config.desktop_mode.clone(),
+                workspace: 0,
+                virtual_output: true,
+            }),
             helper: config.desktop_helper.clone(),
         }),
     };
@@ -133,6 +180,10 @@ async fn main() -> Result<()> {
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
+        .route(
+            "/api/desktop/launch-terminal",
+            post(desktop_launch_terminal),
+        )
         .route("/ws/terminal", get(terminal_ws))
         .route("/ws/desktop", get(desktop_ws))
         .fallback_service(static_files)
@@ -435,25 +486,44 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let desktop = &state.desktop;
+    let outputs = match desktop.outputs().await {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            warn!(%error, "could not enumerate desktop outputs");
+            Vec::new()
+        }
+    };
+    let selection = desktop.selection();
     Json(DesktopStatusResponse {
         available: desktop.helper.is_file(),
         active: desktop.active.load(Ordering::Acquire),
         viewer_connected: desktop.viewer_connected.load(Ordering::Acquire),
-        output: desktop.output.clone(),
-        mode: desktop.mode.clone(),
-        workspace: desktop.workspace.load(Ordering::Acquire),
+        output: selection.output,
+        mode: selection.mode,
+        workspace: selection.workspace,
         transport: "WebRTC/VP8",
         input: "WebRTC DataChannel",
+        virtual_output: selection.virtual_output,
+        outputs,
     })
     .into_response()
 }
 
-async fn desktop_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn desktop_start(
+    State(state): State<AppState>,
+    Query(query): Query<DesktopStartQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.desktop.start().await {
-        Ok(()) => Json(serde_json::json!({ "active": true })).into_response(),
+    match state.desktop.start(query.output.as_deref()).await {
+        Ok(selection) => Json(serde_json::json!({
+            "active": true,
+            "output": selection.output,
+            "workspace": selection.workspace,
+        }))
+        .into_response(),
         Err(error) => {
             error!(%error, "could not start virtual desktop");
             (
@@ -462,6 +532,20 @@ async fn desktop_start(State(state): State<AppState>, headers: HeaderMap) -> Res
             )
                 .into_response()
         }
+    }
+}
+
+async fn desktop_launch_terminal(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.desktop.launch_terminal().await {
+        Ok(workspace) => Json(serde_json::json!({ "workspace": workspace })).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -491,7 +575,7 @@ async fn desktop_ws(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if !state.desktop.active.load(Ordering::Acquire) {
-        return (StatusCode::CONFLICT, "virtual desktop is not active").into_response();
+        return (StatusCode::CONFLICT, "desktop capture is not active").into_response();
     }
     if state
         .desktop
@@ -516,35 +600,81 @@ async fn desktop_ws(
 }
 
 impl DesktopManager {
-    async fn start(&self) -> Result<()> {
-        let _transition = self.transition.lock().await;
-        if self.active.load(Ordering::Acquire) {
-            return Ok(());
+    fn selection(&self) -> DesktopSelection {
+        self.selection
+            .lock()
+            .expect("desktop selection poisoned")
+            .clone()
+    }
+
+    async fn outputs(&self) -> Result<Vec<DesktopOutput>> {
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        let mut outputs = parse_outputs(&monitors, &self.headless_output)?;
+        if !outputs
+            .iter()
+            .any(|output| output.name == self.headless_output)
+        {
+            outputs.insert(
+                0,
+                DesktopOutput {
+                    name: self.headless_output.clone(),
+                    description: "Virtual Forge output".into(),
+                    mode: self.headless_mode.clone(),
+                    workspace: 0,
+                    virtual_output: true,
+                },
+            );
         }
+        Ok(outputs)
+    }
+
+    async fn start(&self, requested_output: Option<&str>) -> Result<DesktopSelection> {
+        let _transition = self.transition.lock().await;
         if !self.helper.is_file() {
             anyhow::bail!("WebRTC helper not found at {}", self.helper.display());
         }
 
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        if !monitors.contains(&format!("\"{}\"", self.output)) {
-            hyprctl(&["output", "create", "headless", &self.output]).await?;
+        let requested = requested_output.unwrap_or(&self.headless_output);
+        let previous = self.selection();
+        if self.viewer_connected.load(Ordering::Acquire) && requested != previous.output {
+            anyhow::bail!("disconnect the current viewer before switching output");
         }
-        if let Err(error) = hyprctl(&[
-            "keyword",
-            "monitor",
-            &format!("{}, {},auto,1", self.output, self.mode).replace(", ", ","),
-        ])
-        .await
-        {
-            let _ = hyprctl(&["output", "remove", &self.output]).await;
-            return Err(error);
-        }
+
         let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        let workspace = monitor_workspace(&monitors, &self.output)?;
-        self.workspace.store(workspace, Ordering::Release);
+        let existing = parse_outputs(&monitors, &self.headless_output)?;
+        if requested == self.headless_output {
+            if !existing.iter().any(|output| output.name == requested) {
+                hyprctl(&["output", "create", "headless", &self.headless_output]).await?;
+            }
+            if let Err(error) = hyprctl(&[
+                "keyword",
+                "monitor",
+                &format!("{},{},auto,1", self.headless_output, self.headless_mode),
+            ])
+            .await
+            {
+                let _ = hyprctl(&["output", "remove", &self.headless_output]).await;
+                return Err(error);
+            }
+        } else if !existing.iter().any(|output| output.name == requested) {
+            anyhow::bail!("Wayland output {requested} does not exist");
+        }
+
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        let selected = parse_outputs(&monitors, &self.headless_output)?
+            .into_iter()
+            .find(|output| output.name == requested)
+            .with_context(|| format!("Wayland output {requested} disappeared"))?;
+        let selection = DesktopSelection {
+            output: selected.name,
+            mode: selected.mode,
+            workspace: selected.workspace,
+            virtual_output: selected.virtual_output,
+        };
+        *self.selection.lock().expect("desktop selection poisoned") = selection.clone();
         self.active.store(true, Ordering::Release);
-        info!(output = %self.output, mode = %self.mode, workspace, "virtual desktop started");
-        Ok(())
+        info!(output = %selection.output, mode = %selection.mode, workspace = selection.workspace, "desktop capture started");
+        Ok(selection)
     }
 
     async fn stop(&self) -> Result<()> {
@@ -552,10 +682,52 @@ impl DesktopManager {
         if !self.active.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        hyprctl(&["output", "remove", &self.output]).await?;
-        info!(output = %self.output, "virtual desktop stopped");
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        if parse_outputs(&monitors, &self.headless_output)?
+            .iter()
+            .any(|output| output.name == self.headless_output)
+        {
+            hyprctl(&["output", "remove", &self.headless_output]).await?;
+        }
+        info!("desktop capture stopped");
         Ok(())
     }
+
+    async fn launch_terminal(&self) -> Result<u32> {
+        if !self.active.load(Ordering::Acquire) {
+            anyhow::bail!("start a desktop capture first");
+        }
+        let selection = self.selection();
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        let workspace = monitor_workspace(&monitors, &selection.output)?;
+        let rule = format!("[workspace {workspace} silent] kitty --title EutherGate-Remote-Forge");
+        hyprctl(&["dispatch", "exec", &rule]).await?;
+        Ok(workspace)
+    }
+}
+
+fn parse_outputs(monitors: &str, headless_output: &str) -> Result<Vec<DesktopOutput>> {
+    let monitors: Vec<HyprMonitor> =
+        serde_json::from_str(monitors).context("hyprctl returned invalid monitor JSON")?;
+    Ok(monitors
+        .into_iter()
+        .map(|monitor| DesktopOutput {
+            virtual_output: monitor.name == headless_output,
+            mode: format!(
+                "{}x{}@{}",
+                monitor.width,
+                monitor.height,
+                monitor.refresh_rate.round() as u32
+            ),
+            workspace: monitor.active_workspace.id,
+            description: if monitor.description.is_empty() {
+                "Virtual output".into()
+            } else {
+                monitor.description
+            },
+            name: monitor.name,
+        })
+        .collect())
 }
 
 fn monitor_workspace(monitors: &str, output: &str) -> Result<u32> {
@@ -591,9 +763,10 @@ async fn hyprctl(args: &[&str]) -> Result<String> {
 }
 
 async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+    let selection = desktop.selection();
     let mut child = Command::new("python")
         .arg(&desktop.helper)
-        .args(["--output", &desktop.output, "--mode", &desktop.mode])
+        .args(["--output", &selection.output, "--mode", &selection.mode])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -747,5 +920,35 @@ mod tests {
         ]"#;
         assert_eq!(monitor_workspace(monitors, "EUTHERGATE-1").unwrap(), 50);
         assert!(monitor_workspace(monitors, "MISSING").is_err());
+    }
+
+    #[test]
+    fn output_parser_distinguishes_physical_and_virtual_outputs() {
+        let monitors = r#"[
+            {
+                "name":"DP-1",
+                "description":"DisplayPort monitor",
+                "width":1600,
+                "height":900,
+                "refreshRate":60.0,
+                "activeWorkspace":{"id":2}
+            },
+            {
+                "name":"EUTHERGATE-1",
+                "description":"",
+                "width":1280,
+                "height":720,
+                "refreshRate":30.0,
+                "activeWorkspace":{"id":3}
+            }
+        ]"#;
+        let outputs = parse_outputs(monitors, "EUTHERGATE-1").unwrap();
+
+        assert_eq!(outputs[0].name, "DP-1");
+        assert_eq!(outputs[0].mode, "1600x900@60");
+        assert_eq!(outputs[0].workspace, 2);
+        assert!(!outputs[0].virtual_output);
+        assert_eq!(outputs[1].description, "Virtual output");
+        assert!(outputs[1].virtual_output);
     }
 }

@@ -17,6 +17,16 @@ type DesktopStatus = {
   workspace: number;
   transport: string;
   input: string;
+  virtual_output: boolean;
+  outputs: DesktopOutput[];
+};
+
+type DesktopOutput = {
+  name: string;
+  description: string;
+  mode: string;
+  workspace: number;
+  virtual_output: boolean;
 };
 
 const appNode = document.querySelector<HTMLDivElement>("#app");
@@ -33,6 +43,7 @@ let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
 let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
+let desktopControlActive = false;
 
 function gateShell(content: string): string {
   return `
@@ -137,6 +148,8 @@ async function renderDesktop(): Promise<void> {
         </div>
         <div class="actions">
           <span id="desktop-state" class="socket-state">PROBING</span>
+          <select id="desktop-output-picker" class="output-picker" aria-label="Wayland output" disabled></select>
+          <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
           <button id="desktop-power" class="ghost-button primary-action" type="button" disabled>START DESKTOP</button>
         </div>
@@ -154,13 +167,15 @@ async function renderDesktop(): Promise<void> {
         </div>
       </div>
       <div class="desktop-footer">
-        <span>Click the desktop to focus keyboard and pointer input.</span>
+        <span>Click to enter remote control · Esc returns to the local desktop.</span>
         <span id="desktop-mode">1280×720 @ 30</span>
       </div>
     </section>`);
 
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-power")?.addEventListener("click", toggleDesktop);
+  document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
+  document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
   installDesktopInput();
 
   try {
@@ -189,6 +204,18 @@ function updateDesktopStatus(status: DesktopStatus): void {
   if (mode) mode.textContent = status.mode.replace("x", "×").replace("@", " @ ");
   const transport = document.querySelector<HTMLElement>("#desktop-transport");
   if (transport) transport.textContent = `${status.transport.replace("WebRTC/", "")} / DATACHANNEL`;
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-output-picker");
+  if (picker) {
+    picker.innerHTML = status.outputs.map((candidate) => {
+      const label = candidate.virtual_output
+        ? `${candidate.name} — Virtual Forge`
+        : `${candidate.name} — ${candidate.description}`;
+      return `<option value="${escapeHtml(candidate.name)}"${candidate.name === status.output ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    }).join("");
+    picker.disabled = false;
+  }
+  const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
+  if (terminalButton) terminalButton.disabled = !status.active;
   setDesktopState(status.active ? "NEGOTIATING" : "OFFLINE");
 }
 
@@ -199,7 +226,9 @@ async function toggleDesktop(): Promise<void> {
   button.disabled = true;
   setDesktopState(active ? "STOPPING" : "STARTING");
   try {
-    const response = await fetch(active ? "/api/desktop/stop" : "/api/desktop/start", { method: "POST" });
+    const selectedOutput = document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.value;
+    const startUrl = selectedOutput ? `/api/desktop/start?output=${encodeURIComponent(selectedOutput)}` : "/api/desktop/start";
+    const response = await fetch(active ? "/api/desktop/stop" : startUrl, { method: "POST" });
     const body = (await response.json()) as { active?: boolean; error?: string };
     if (!response.ok) throw new Error(body.error || "Desktop transition failed.");
     button.dataset.active = String(!active);
@@ -209,6 +238,8 @@ async function toggleDesktop(): Promise<void> {
       setDesktopState("OFFLINE");
       showDesktopMessage("Virtual Wayland output offline");
     } else {
+      const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
+      if (terminalButton) terminalButton.disabled = false;
       connectDesktop();
     }
   } catch (error) {
@@ -216,6 +247,45 @@ async function toggleDesktop(): Promise<void> {
     showDesktopMessage(error instanceof Error ? error.message : "Desktop transition failed.");
   } finally {
     button.disabled = false;
+  }
+}
+
+async function switchDesktopOutput(): Promise<void> {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-output-picker");
+  const power = document.querySelector<HTMLButtonElement>("#desktop-power");
+  if (!picker || !power || power.dataset.active !== "true") return;
+  picker.disabled = true;
+  setDesktopState("SWITCHING");
+  disposeDesktop();
+  await new Promise((resolve) => window.setTimeout(resolve, 250));
+  try {
+    const response = await fetch(`/api/desktop/start?output=${encodeURIComponent(picker.value)}`, { method: "POST" });
+    const body = (await response.json()) as { error?: string };
+    if (!response.ok) throw new Error(body.error || "Output switch failed.");
+    const statusResponse = await fetch("/api/desktop/status");
+    const status = (await statusResponse.json()) as DesktopStatus;
+    updateDesktopStatus(status);
+    connectDesktop();
+  } catch (error) {
+    setDesktopState("FAULT");
+    showDesktopMessage(error instanceof Error ? error.message : "Output switch failed.");
+  } finally {
+    picker.disabled = false;
+  }
+}
+
+async function launchDesktopTerminal(): Promise<void> {
+  const button = document.querySelector<HTMLButtonElement>("#desktop-terminal");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch("/api/desktop/launch-terminal", { method: "POST" });
+    const body = (await response.json()) as { error?: string };
+    if (!response.ok) throw new Error(body.error || "Could not launch terminal.");
+  } catch (error) {
+    setDesktopState("LAUNCH FAILED");
+    showDesktopMessage(error instanceof Error ? error.message : "Could not launch terminal.");
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -304,6 +374,11 @@ function installDesktopInput(): void {
   const video = document.querySelector<HTMLVideoElement>("#desktop-video");
   if (!frame || !video) return;
   frame.addEventListener("pointermove", (event) => {
+    if (!desktopControlActive) return;
+    if (document.pointerLockElement === frame) {
+      sendDesktopInput({ type: "pointer_delta", dx: event.movementX, dy: event.movementY });
+      return;
+    }
     const rect = video.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     sendDesktopInput({
@@ -313,9 +388,11 @@ function installDesktopInput(): void {
     });
   });
   frame.addEventListener("pointerdown", (event) => {
+    if (!desktopVideoReady) return;
     event.preventDefault();
+    desktopControlActive = true;
     frame.focus();
-    frame.setPointerCapture(event.pointerId);
+    if (document.pointerLockElement !== frame) frame.requestPointerLock();
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
   });
   frame.addEventListener("pointerup", (event) => {
@@ -328,12 +405,17 @@ function installDesktopInput(): void {
   }, { passive: false });
   window.addEventListener("keydown", desktopKeyEvent, { capture: true });
   window.addEventListener("keyup", desktopKeyEvent, { capture: true });
+  document.addEventListener("pointerlockchange", desktopPointerLockChange);
 }
 
 function desktopKeyEvent(event: KeyboardEvent): void {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
   if (!frame || document.activeElement !== frame) return;
   event.preventDefault();
+  if (event.code === "Escape") {
+    if (event.type === "keydown") releaseDesktopControl();
+    return;
+  }
   sendDesktopInput({
     type: "key",
     code: event.code,
@@ -344,6 +426,27 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     shift: event.shiftKey,
     meta: event.metaKey,
   });
+}
+
+function desktopPointerLockChange(): void {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  if (frame && document.pointerLockElement === frame) {
+    desktopControlActive = true;
+    setDesktopState("CONTROL / ESC TO EXIT");
+  } else if (desktopControlActive) {
+    releaseDesktopControl(false);
+  }
+}
+
+function releaseDesktopControl(exitPointerLock = true): void {
+  if (!desktopControlActive) return;
+  desktopControlActive = false;
+  if (desktopVideoReady && inputChannel?.readyState === "open") {
+    inputChannel.send(JSON.stringify({ type: "release_control" }));
+  }
+  if (exitPointerLock && document.pointerLockElement) document.exitPointerLock();
+  document.querySelector<HTMLDivElement>("#desktop-frame")?.blur();
+  setDesktopState("LIVE");
 }
 
 function sendDesktopInput(message: Record<string, unknown>): void {
@@ -461,8 +564,10 @@ function disposeTerminal(): void {
 }
 
 function disposeDesktop(): void {
+  releaseDesktopControl();
   window.removeEventListener("keydown", desktopKeyEvent, { capture: true });
   window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
+  document.removeEventListener("pointerlockchange", desktopPointerLockChange);
   inputChannel?.close();
   inputChannel = null;
   peer?.close();
@@ -473,6 +578,7 @@ function disposeDesktop(): void {
   }
   remoteCandidates = [];
   desktopVideoReady = false;
+  desktopControlActive = false;
   if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
   desktopNegotiationTimer = null;
 }

@@ -61,6 +61,13 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 .socket-state { color: var(--acid); }
 .ghost-button { border: 1px solid #343b3c; padding: 10px 13px; color: #9ca49f; background: transparent; font: 700 9px "Space Mono", monospace; letter-spacing: .12em; }
 .ghost-button:hover { color: #eef3ef; border-color: #68716c; }
+.output-picker {
+  max-width: 230px; padding: 10px 30px 10px 11px; border: 1px solid #343b3c;
+  border-radius: 0; color: #cbd3ce; background: #0d1115;
+  font: 700 9px "Space Mono", monospace; letter-spacing: .06em;
+}
+.output-picker:focus { outline: 1px solid var(--acid); outline-offset: 1px; }
+.output-picker:disabled { opacity: .45; }
 .primary-action { color: var(--acid); border-color: #53672c; }
 .primary-action:hover { color: #e3ff9d; border-color: var(--acid); }
 .primary-action:disabled { cursor: wait; opacity: .5; }
@@ -112,4 +119,6 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   .desktop-workspace { height: calc(100vh - 62px); }
   .desktop-frame { min-height: 300px; }
   .desktop-footer span:first-child { display: none; }
+  .output-picker { max-width: 145px; }
+  #desktop-terminal { display: none; }
 }

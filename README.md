@@ -10,7 +10,7 @@ The first two checkpoints form a usable vertical slice:
 - one persistent terminal session that survives browser reloads;
 - resize support and a bounded output replay buffer;
 - a small health/status API for automation.
-- a real headless Hyprland output created on demand;
+- a selectable physical or headless Hyprland output;
 - VP8 desktop video transported with WebRTC;
 - pointer, keyboard and wheel events over a WebRTC DataChannel;
 - a browser switcher between Gate Shell and Remote Forge.
@@ -48,9 +48,14 @@ cargo run
 ```
 
 Open `http://127.0.0.1:8787` and enter the token from `.env`.
-Select **DESKTOP**, then **START DESKTOP**. EutherGate creates `EUTHERGATE-1`
-as a real virtual Hyprland output. To launch an application on its reported
-workspace from Gate Shell, use for example:
+Select **DESKTOP**, choose an output, then **START DESKTOP**. A physical output
+such as `DP-1` shows its current Hyprland workspace and existing windows.
+`EUTHERGATE-1` creates an isolated virtual output for remote-only work. This is
+Wayland output/workspace selection inside the current graphical session, not a
+switch between Linux virtual terminals (TTYs).
+
+Use **OPEN TERMINAL** to launch Kitty directly on the selected output's active
+workspace. The equivalent command from Gate Shell is, for example:
 
 ```bash
 hyprctl dispatch exec '[workspace 3 silent] kitty'
@@ -58,6 +63,10 @@ hyprctl dispatch exec '[workspace 3 silent] kitty'
 
 The workspace number is shown in the lower-left WebRTC HUD and may differ from
 `3` depending on the current compositor state.
+
+Click the streamed desktop to enter remote control. The browser locks the
+pointer for relative movement; press **Esc** to leave remote control and return
+the host cursor to the position it had before control began.
 
 With the gateway running, an optional end-to-end reconnect smoke test is:
 
