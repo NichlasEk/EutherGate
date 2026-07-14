@@ -8,6 +8,17 @@ type Status = {
   terminal_ready: boolean;
 };
 
+type DesktopStatus = {
+  available: boolean;
+  active: boolean;
+  viewer_connected: boolean;
+  output: string;
+  mode: string;
+  workspace: number;
+  transport: string;
+  input: string;
+};
+
 const appNode = document.querySelector<HTMLDivElement>("#app");
 if (!appNode) throw new Error("Missing #app");
 const app: HTMLDivElement = appNode;
@@ -17,6 +28,9 @@ const decoder = new TextDecoder();
 let socket: WebSocket | null = null;
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
+let peer: RTCPeerConnection | null = null;
+let inputChannel: RTCDataChannel | null = null;
+let remoteCandidates: RTCIceCandidateInit[] = [];
 
 function gateShell(content: string): string {
   return `
@@ -33,7 +47,7 @@ function gateShell(content: string): string {
 }
 
 function renderLogin(message = ""): void {
-  disposeTerminal();
+  disposeViews();
   app.innerHTML = gateShell(`
     <section class="login-wrap">
       <div class="eyebrow">REMOTE FORGE ENVIRONMENT</div>
@@ -54,6 +68,7 @@ function renderLogin(message = ""): void {
 }
 
 function renderTerminal(): void {
+  disposeViews();
   app.innerHTML = gateShell(`
     <section class="workspace">
       <div class="workspace-bar">
@@ -63,6 +78,7 @@ function renderTerminal(): void {
         </div>
         <div class="actions">
           <span id="socket-state" class="socket-state">CONNECTING</span>
+          <button id="show-desktop" class="ghost-button primary-action" type="button">DESKTOP</button>
           <button id="logout" class="ghost-button" type="button">CLOSE GATE</button>
         </div>
       </div>
@@ -104,7 +120,225 @@ function renderTerminal(): void {
   terminal.onResize(sendResize);
   window.addEventListener("resize", fitTerminal);
   document.querySelector<HTMLButtonElement>("#logout")?.addEventListener("click", logout);
+  document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
   connectSocket();
+}
+
+async function renderDesktop(): Promise<void> {
+  disposeViews();
+  app.innerHTML = gateShell(`
+    <section class="workspace desktop-workspace">
+      <div class="workspace-bar">
+        <div>
+          <span class="eyebrow">GLASS STREAM / WAYLAND OUTPUT</span>
+          <h1>Remote forge</h1>
+        </div>
+        <div class="actions">
+          <span id="desktop-state" class="socket-state">PROBING</span>
+          <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
+          <button id="desktop-power" class="ghost-button primary-action" type="button" disabled>START DESKTOP</button>
+        </div>
+      </div>
+      <div class="desktop-frame" id="desktop-frame" tabindex="0">
+        <video id="desktop-video" autoplay playsinline muted></video>
+        <div class="desktop-empty" id="desktop-empty">
+          <span class="brand-mark large" aria-hidden="true"><i></i></span>
+          <strong>Virtual Wayland output offline</strong>
+          <p>Start the headless forge, then video and input travel over WebRTC.</p>
+        </div>
+        <div class="stream-hud">
+          <span id="desktop-output">EUTHERGATE-1</span>
+          <span>H.264 / DATACHANNEL</span>
+        </div>
+      </div>
+      <div class="desktop-footer">
+        <span>Click the desktop to focus keyboard and pointer input.</span>
+        <span id="desktop-mode">1280×720 @ 30</span>
+      </div>
+    </section>`);
+
+  document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
+  document.querySelector<HTMLButtonElement>("#desktop-power")?.addEventListener("click", toggleDesktop);
+  installDesktopInput();
+
+  try {
+    const response = await fetch("/api/desktop/status");
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    if (!response.ok) throw new Error("Desktop service did not answer.");
+    const status = (await response.json()) as DesktopStatus;
+    updateDesktopStatus(status);
+    if (status.active) connectDesktop();
+  } catch (error) {
+    setDesktopState("UNAVAILABLE");
+    showDesktopMessage(error instanceof Error ? error.message : "Desktop probe failed.");
+  }
+}
+
+function updateDesktopStatus(status: DesktopStatus): void {
+  const power = document.querySelector<HTMLButtonElement>("#desktop-power");
+  if (power) {
+    power.disabled = !status.available;
+    power.textContent = status.active ? "STOP DESKTOP" : "START DESKTOP";
+    power.dataset.active = String(status.active);
+  }
+  const output = document.querySelector<HTMLElement>("#desktop-output");
+  if (output) output.textContent = `${status.output} / WS ${status.workspace}`;
+  const mode = document.querySelector<HTMLElement>("#desktop-mode");
+  if (mode) mode.textContent = status.mode.replace("x", "×").replace("@", " @ ");
+  setDesktopState(status.active ? "NEGOTIATING" : "OFFLINE");
+}
+
+async function toggleDesktop(): Promise<void> {
+  const button = document.querySelector<HTMLButtonElement>("#desktop-power");
+  if (!button) return;
+  const active = button.dataset.active === "true";
+  button.disabled = true;
+  setDesktopState(active ? "STOPPING" : "STARTING");
+  try {
+    const response = await fetch(active ? "/api/desktop/stop" : "/api/desktop/start", { method: "POST" });
+    const body = (await response.json()) as { active?: boolean; error?: string };
+    if (!response.ok) throw new Error(body.error || "Desktop transition failed.");
+    button.dataset.active = String(!active);
+    button.textContent = active ? "START DESKTOP" : "STOP DESKTOP";
+    if (active) {
+      disposeDesktop();
+      setDesktopState("OFFLINE");
+      showDesktopMessage("Virtual Wayland output offline");
+    } else {
+      connectDesktop();
+    }
+  } catch (error) {
+    setDesktopState("FAULT");
+    showDesktopMessage(error instanceof Error ? error.message : "Desktop transition failed.");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function connectDesktop(): void {
+  disposeDesktop();
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${protocol}//${location.host}/ws/desktop`);
+  remoteCandidates = [];
+  setDesktopState("NEGOTIATING");
+
+  peer = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+  peer.addTransceiver("video", { direction: "recvonly" });
+  inputChannel = peer.createDataChannel("input", { ordered: false, maxRetransmits: 0 });
+  inputChannel.addEventListener("open", () => setDesktopState("LIVE"));
+  inputChannel.addEventListener("close", () => setDesktopState("VIDEO ONLY"));
+  peer.addEventListener("track", (event) => {
+    const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+    if (video) video.srcObject = event.streams[0] || new MediaStream([event.track]);
+    hideDesktopMessage();
+  });
+  peer.addEventListener("icecandidate", (event) => {
+    if (event.candidate && socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "ice", ...event.candidate.toJSON() }));
+    }
+  });
+  peer.addEventListener("connectionstatechange", () => {
+    if (peer?.connectionState === "connected") setDesktopState(inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
+    if (["failed", "disconnected", "closed"].includes(peer?.connectionState || "")) setDesktopState("RECONNECTING");
+  });
+
+  socket.addEventListener("open", async () => {
+    if (!peer || socket?.readyState !== WebSocket.OPEN) return;
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    socket.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+  });
+  socket.addEventListener("message", async (event) => {
+    const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+    if (message.type === "answer" && peer) {
+      await peer.setRemoteDescription({ type: "answer", sdp: String(message.sdp) });
+      for (const candidate of remoteCandidates) await peer.addIceCandidate(candidate);
+      remoteCandidates = [];
+    } else if (message.type === "ice" && peer) {
+      const candidate = { candidate: String(message.candidate), sdpMLineIndex: Number(message.sdpMLineIndex) };
+      if (peer.remoteDescription) await peer.addIceCandidate(candidate);
+      else remoteCandidates.push(candidate);
+    } else if (message.type === "error" || message.type === "fatal") {
+      showDesktopMessage(String(message.message || "WebRTC media failure"));
+      setDesktopState("FAULT");
+    } else if (message.type === "capture-warning" || message.type === "input-warning") {
+      console.warn("EutherGate desktop:", message.message);
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (peer) setDesktopState("DISCONNECTED");
+  });
+}
+
+function installDesktopInput(): void {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  if (!frame || !video) return;
+  frame.addEventListener("pointermove", (event) => {
+    const rect = video.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    sendDesktopInput({
+      type: "pointer_move",
+      x: ((event.clientX - rect.left) / rect.width) * (video.videoWidth || 1280),
+      y: ((event.clientY - rect.top) / rect.height) * (video.videoHeight || 720),
+    });
+  });
+  frame.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    frame.focus();
+    frame.setPointerCapture(event.pointerId);
+    sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
+  });
+  frame.addEventListener("pointerup", (event) => {
+    sendDesktopInput({ type: "pointer_button", button: event.button, state: "released" });
+  });
+  frame.addEventListener("contextmenu", (event) => event.preventDefault());
+  frame.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    sendDesktopInput({ type: "wheel", dx: event.deltaX, dy: event.deltaY });
+  }, { passive: false });
+  window.addEventListener("keydown", desktopKeyEvent, { capture: true });
+  window.addEventListener("keyup", desktopKeyEvent, { capture: true });
+}
+
+function desktopKeyEvent(event: KeyboardEvent): void {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  if (!frame || document.activeElement !== frame) return;
+  event.preventDefault();
+  sendDesktopInput({
+    type: "key",
+    code: event.code,
+    state: event.type === "keydown" ? "pressed" : "released",
+    repeat: event.repeat,
+    ctrl: event.ctrlKey,
+    alt: event.altKey,
+    shift: event.shiftKey,
+    meta: event.metaKey,
+  });
+}
+
+function sendDesktopInput(message: Record<string, unknown>): void {
+  if (inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(message));
+}
+
+function setDesktopState(value: string): void {
+  const state = document.querySelector<HTMLElement>("#desktop-state");
+  if (state) state.textContent = value;
+  const label = document.querySelector<HTMLElement>("#connection-label");
+  if (label) label.textContent = value === "LIVE" ? "DESKTOP LIVE" : value;
+}
+
+function showDesktopMessage(message: string): void {
+  const empty = document.querySelector<HTMLElement>("#desktop-empty");
+  if (!empty) return;
+  empty.hidden = false;
+  const strong = empty.querySelector("strong");
+  if (strong) strong.textContent = message;
+}
+
+function hideDesktopMessage(): void {
+  const empty = document.querySelector<HTMLElement>("#desktop-empty");
+  if (empty) empty.hidden = true;
 }
 
 async function login(event: SubmitEvent): Promise<void> {
@@ -183,6 +417,11 @@ function setSocketState(value: string): void {
   if (label) label.textContent = value === "LIVE" ? "GATE ONLINE" : value;
 }
 
+function disposeViews(): void {
+  disposeTerminal();
+  disposeDesktop();
+}
+
 function disposeTerminal(): void {
   window.removeEventListener("resize", fitTerminal);
   socket?.close();
@@ -190,6 +429,20 @@ function disposeTerminal(): void {
   terminal?.dispose();
   terminal = null;
   fitAddon = null;
+}
+
+function disposeDesktop(): void {
+  window.removeEventListener("keydown", desktopKeyEvent, { capture: true });
+  window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
+  inputChannel?.close();
+  inputChannel = null;
+  peer?.close();
+  peer = null;
+  if (!terminal) {
+    socket?.close();
+    socket = null;
+  }
+  remoteCandidates = [];
 }
 
 function escapeHtml(value: string): string {

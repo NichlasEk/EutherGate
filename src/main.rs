@@ -4,6 +4,8 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     path::PathBuf,
+    process::Stdio,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -24,7 +26,11 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, broadcast};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::{Mutex, broadcast},
+};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -41,6 +47,7 @@ struct AppState {
     auth_session: Arc<str>,
     secure_cookie: bool,
     terminal: Arc<TerminalSession>,
+    desktop: Arc<DesktopManager>,
 }
 
 struct TerminalSession {
@@ -48,6 +55,16 @@ struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     _child: StdMutex<Box<dyn portable_pty::Child + Send + Sync>>,
     output: Arc<OutputRelay>,
+}
+
+struct DesktopManager {
+    transition: Mutex<()>,
+    active: AtomicBool,
+    viewer_connected: AtomicBool,
+    output: String,
+    mode: String,
+    workspace: AtomicU32,
+    helper: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +76,18 @@ struct LoginRequest {
 struct StatusResponse {
     authenticated: bool,
     terminal_ready: bool,
+}
+
+#[derive(Serialize)]
+struct DesktopStatusResponse {
+    available: bool,
+    active: bool,
+    viewer_connected: bool,
+    output: String,
+    mode: String,
+    workspace: u32,
+    transport: &'static str,
+    input: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +112,15 @@ async fn main() -> Result<()> {
         auth_session: Arc::from(random_secret(32)),
         secure_cookie: config.secure_cookie,
         terminal,
+        desktop: Arc::new(DesktopManager {
+            transition: Mutex::new(()),
+            active: AtomicBool::new(false),
+            viewer_connected: AtomicBool::new(false),
+            output: config.desktop_output.clone(),
+            mode: config.desktop_mode.clone(),
+            workspace: AtomicU32::new(0),
+            helper: config.desktop_helper.clone(),
+        }),
     };
 
     let static_files = ServeDir::new(&config.web_root)
@@ -92,7 +130,11 @@ async fn main() -> Result<()> {
         .route("/api/status", get(status))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route("/api/desktop/status", get(desktop_status))
+        .route("/api/desktop/start", post(desktop_start))
+        .route("/api/desktop/stop", post(desktop_stop))
         .route("/ws/terminal", get(terminal_ws))
+        .route("/ws/desktop", get(desktop_ws))
         .fallback_service(static_files)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -117,6 +159,9 @@ struct Config {
     shell: PathBuf,
     workdir: PathBuf,
     web_root: PathBuf,
+    desktop_output: String,
+    desktop_mode: String,
+    desktop_helper: PathBuf,
 }
 
 impl Config {
@@ -143,6 +188,13 @@ impl Config {
         let web_root = env::var_os("EUTHERGATE_WEB_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("web/dist"));
+        let desktop_output =
+            env::var("EUTHERGATE_DESKTOP_OUTPUT").unwrap_or_else(|_| "EUTHERGATE-1".into());
+        let desktop_mode =
+            env::var("EUTHERGATE_DESKTOP_MODE").unwrap_or_else(|_| "1280x720@30".into());
+        let desktop_helper = env::var_os("EUTHERGATE_DESKTOP_HELPER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("scripts/webrtc_desktop.py"));
 
         Ok(Self {
             bind,
@@ -152,6 +204,9 @@ impl Config {
             shell,
             workdir,
             web_root,
+            desktop_output,
+            desktop_mode,
+            desktop_helper,
         })
     }
 }
@@ -375,6 +430,227 @@ async fn terminal_socket(socket: WebSocket, terminal: Arc<TerminalSession>) {
     }
 }
 
+async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let desktop = &state.desktop;
+    Json(DesktopStatusResponse {
+        available: desktop.helper.is_file(),
+        active: desktop.active.load(Ordering::Acquire),
+        viewer_connected: desktop.viewer_connected.load(Ordering::Acquire),
+        output: desktop.output.clone(),
+        mode: desktop.mode.clone(),
+        workspace: desktop.workspace.load(Ordering::Acquire),
+        transport: "WebRTC/H.264",
+        input: "WebRTC DataChannel",
+    })
+    .into_response()
+}
+
+async fn desktop_start(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.desktop.start().await {
+        Ok(()) => Json(serde_json::json!({ "active": true })).into_response(),
+        Err(error) => {
+            error!(%error, "could not start virtual desktop");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn desktop_stop(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.desktop.stop().await {
+        Ok(()) => Json(serde_json::json!({ "active": false })).into_response(),
+        Err(error) => {
+            error!(%error, "could not stop virtual desktop");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn desktop_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.desktop.active.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "virtual desktop is not active").into_response();
+    }
+    if state
+        .desktop
+        .viewer_connected
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "a desktop viewer is already connected",
+        )
+            .into_response();
+    }
+    let desktop = state.desktop.clone();
+    ws.on_upgrade(move |socket| async move {
+        if let Err(error) = desktop_socket(socket, desktop.clone()).await {
+            error!(%error, "desktop WebRTC bridge stopped");
+        }
+        desktop.viewer_connected.store(false, Ordering::Release);
+    })
+    .into_response()
+}
+
+impl DesktopManager {
+    async fn start(&self) -> Result<()> {
+        let _transition = self.transition.lock().await;
+        if self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.helper.is_file() {
+            anyhow::bail!("WebRTC helper not found at {}", self.helper.display());
+        }
+
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        if !monitors.contains(&format!("\"{}\"", self.output)) {
+            hyprctl(&["output", "create", "headless", &self.output]).await?;
+        }
+        if let Err(error) = hyprctl(&[
+            "keyword",
+            "monitor",
+            &format!("{}, {},auto,1", self.output, self.mode).replace(", ", ","),
+        ])
+        .await
+        {
+            let _ = hyprctl(&["output", "remove", &self.output]).await;
+            return Err(error);
+        }
+        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
+        let workspace = monitor_workspace(&monitors, &self.output)?;
+        self.workspace.store(workspace, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        info!(output = %self.output, mode = %self.mode, workspace, "virtual desktop started");
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<()> {
+        let _transition = self.transition.lock().await;
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        hyprctl(&["output", "remove", &self.output]).await?;
+        info!(output = %self.output, "virtual desktop stopped");
+        Ok(())
+    }
+}
+
+fn monitor_workspace(monitors: &str, output: &str) -> Result<u32> {
+    let monitors: serde_json::Value =
+        serde_json::from_str(monitors).context("hyprctl returned invalid monitor JSON")?;
+    monitors
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("name").and_then(|name| name.as_str()) == Some(output))
+        })
+        .and_then(|item| item.pointer("/activeWorkspace/id"))
+        .and_then(|id| id.as_u64())
+        .and_then(|id| u32::try_from(id).ok())
+        .with_context(|| format!("Hyprland output {output} has no active workspace"))
+}
+
+async fn hyprctl(args: &[&str]) -> Result<String> {
+    let output = Command::new("hyprctl")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("could not run hyprctl {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "hyprctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+    let mut child = Command::new("python")
+        .arg(&desktop.helper)
+        .args(["--output", &desktop.output, "--mode", &desktop.mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("could not start {}", desktop.helper.display()))?;
+    let mut child_input = child
+        .stdin
+        .take()
+        .context("WebRTC helper stdin unavailable")?;
+    let child_output = child
+        .stdout
+        .take()
+        .context("WebRTC helper stdout unavailable")?;
+    let mut child_lines = BufReader::new(child_output).lines();
+    let (mut sender, mut receiver) = socket.split();
+
+    loop {
+        tokio::select! {
+            line = child_lines.next_line() => match line {
+                Ok(Some(line)) => {
+                    if sender.send(Message::Text(line.into())).await.is_err() { break; }
+                }
+                Ok(None) => break,
+                Err(error) => return Err(error).context("could not read WebRTC helper output"),
+            },
+            message = receiver.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    child_input.write_all(text.as_bytes()).await?;
+                    child_input.write_all(b"\n").await?;
+                    child_input.flush().await?;
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    warn!(%error, "desktop signaling WebSocket disconnected");
+                    break;
+                }
+            },
+            status = child.wait() => {
+                let status = status.context("could not wait for WebRTC helper")?;
+                anyhow::bail!("WebRTC helper exited with {status}");
+            }
+        }
+    }
+
+    let _ = child_input.write_all(b"{\"type\":\"stop\"}\n").await;
+    drop(child_input);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    Ok(())
+}
+
 fn is_authenticated(headers: &HeaderMap, state: &AppState) -> bool {
     headers
         .get(header::COOKIE)
@@ -461,5 +737,15 @@ mod tests {
     fn token_hash_is_stable_and_not_plaintext() {
         assert_eq!(hash_token("gate"), hash_token("gate"));
         assert_ne!(hash_token("gate"), hash_token("other"));
+    }
+
+    #[test]
+    fn monitor_workspace_finds_the_headless_output() {
+        let monitors = r#"[
+            {"name":"DP-1","activeWorkspace":{"id":2}},
+            {"name":"EUTHERGATE-1","activeWorkspace":{"id":50}}
+        ]"#;
+        assert_eq!(monitor_workspace(monitors, "EUTHERGATE-1").unwrap(), 50);
+        assert!(monitor_workspace(monitors, "MISSING").is_err());
     }
 }

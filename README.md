@@ -3,17 +3,26 @@
 EutherGate is a secure browser gate to a remote development machine: persistent
 terminal sessions first, then files, builds, Codex and streamed Wayland apps.
 
-The first checkpoint is deliberately narrow and already useful:
+The first two checkpoints form a usable vertical slice:
 
 - token login with an HttpOnly, SameSite cookie;
 - a real PTY-backed shell in the browser;
 - one persistent terminal session that survives browser reloads;
 - resize support and a bounded output replay buffer;
 - a small health/status API for automation.
+- a real headless Hyprland output created on demand;
+- H.264 desktop video transported with WebRTC;
+- pointer, keyboard and wheel events over a WebRTC DataChannel;
+- a browser switcher between Gate Shell and Remote Forge.
 
 ## Run it
 
 Requirements: Rust, Node.js and npm.
+
+Remote Forge additionally needs an active Hyprland session, `grim`, Python with
+PyGObject and `websockets`, and the GStreamer WebRTC, OpenH264 and libav plugins.
+On Arch Linux these are supplied by `gstreamer`, `gst-plugins-bad`,
+`gst-plugins-good`, `gst-libav`, `gst-python`, `python-websockets` and `grim`.
 
 ```bash
 cp .env.example .env
@@ -24,6 +33,16 @@ cargo run
 ```
 
 Open `http://127.0.0.1:8787` and enter the token from `.env`.
+Select **DESKTOP**, then **START DESKTOP**. EutherGate creates `EUTHERGATE-1`
+as a real virtual Hyprland output. To launch an application on its reported
+workspace from Gate Shell, use for example:
+
+```bash
+hyprctl dispatch exec '[workspace 3 silent] kitty'
+```
+
+The workspace number is shown in the lower-left WebRTC HUD and may differ from
+`3` depending on the current compositor state.
 
 With the gateway running, an optional end-to-end reconnect smoke test is:
 
@@ -32,6 +51,16 @@ EUTHERGATE_TOKEN=your-token python scripts/smoke_terminal.py
 ```
 
 It requires the Python `websockets` package.
+
+The full media and input smoke test requires a running gateway and active
+Hyprland session:
+
+```bash
+EUTHERGATE_TOKEN=your-token python scripts/smoke_webrtc.py
+```
+
+It starts the virtual output, negotiates WebRTC, decodes a real H.264 desktop
+frame, opens the DataChannel and sends a pointer event.
 
 For frontend work, run the gateway and Vite separately:
 
@@ -51,11 +80,22 @@ Vite proxies `/api` and `/ws` to the gateway.
 | `EUTHERGATE_SHELL` | `$SHELL`, then `/bin/sh` | Shell started inside the PTY. |
 | `EUTHERGATE_WORKDIR` | current directory | Initial directory for the shell. |
 | `EUTHERGATE_WEB_ROOT` | `web/dist` | Built frontend directory. |
+| `EUTHERGATE_DESKTOP_OUTPUT` | `EUTHERGATE-1` | Name of the headless Hyprland output. |
+| `EUTHERGATE_DESKTOP_MODE` | `1280x720@30` | Virtual output resolution and frame rate. |
+| `EUTHERGATE_DESKTOP_HELPER` | `scripts/webrtc_desktop.py` | GStreamer media helper. |
 | `EUTHERGATE_SECURE_COOKIE` | `false` | Add `Secure` to the auth cookie. Enable behind HTTPS. |
 | `RUST_LOG` | `euthergate=info,tower_http=info` | Log filter. |
 
 Never expose this checkpoint directly to the public internet. Put it behind TLS
-and a trusted access layer. The next security slice will add durable users,
-session isolation and explicit reverse-proxy trust.
+and a trusted access layer. A VPN such as Tailscale is currently the simplest
+remote path because ICE only advertises host candidates; internet traversal
+still needs configurable STUN/TURN. The next security slice will also add
+durable users, session isolation and explicit reverse-proxy trust.
+
+Remote Forge currently captures through one `grim` process per frame and
+injects input through Hyprland IPC. This proves the complete browser-to-Wayland
+path, but the next performance slice should replace capture with persistent
+wlroots screencopy buffers and replace IPC input with the advertised virtual
+keyboard/pointer Wayland protocols.
 
 See [docs/architecture.md](docs/architecture.md) for the system direction.

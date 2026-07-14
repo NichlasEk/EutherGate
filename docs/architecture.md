@@ -9,9 +9,9 @@ visual result through one authenticated browser surface.
 The intended path is:
 
 1. **Gate Shell** — authenticated, reconnectable terminal sessions.
-2. **Forge Workspace** — file tree, editor, diffs, builds and logs.
-3. **Glass Stream** — WebRTC video for one Wayland application.
-4. **Remote Seat** — keyboard, pointer and touch input over a data channel.
+2. **Glass Stream** — WebRTC video from a real virtual Wayland output. *(MVP landed)*
+3. **Remote Seat** — keyboard and pointer input over a data channel. *(MVP landed)*
+4. **Forge Workspace** — file tree, editor, diffs, builds and logs.
 5. **Euther Desktop** — virtual outputs, audio, clipboard and resilient sessions.
 6. **Codex Control** — build, launch, observe and iterate inside the same session.
 
@@ -54,3 +54,34 @@ Before internet exposure, add:
 The future WebRTC media plane should remain separate from this control plane.
 Short-lived, session-scoped credentials should connect the two.
 
+## Checkpoint 2: Remote Forge
+
+```text
+Browser <-------- WebRTC H.264 -------- GStreamer webrtcbin
+   |                                      ^
+   +---- WebRTC DataChannel input ------->| Hyprland IPC
+                                          |
+                                     RGB frame feed
+                                          ^
+                                          |
+                               grim / wlroots screencopy
+                                          ^
+                                          |
+                           Hyprland EUTHERGATE-1 headless output
+                                          |
+                               native Wayland applications
+```
+
+EutherGate owns creation and removal of the headless output. The output and its
+applications survive browser WebSocket/WebRTC reconnects; only the media helper
+is replaced. One viewer is permitted at a time in this checkpoint.
+
+GStreamer handles SDP, ICE, DTLS, SRTP, H.264 RTP and SCTP DataChannel traffic.
+The Rust gateway only relays authenticated signaling messages, keeping media off
+the HTTP control plane.
+
+The current capture loop intentionally favors a verifiable end-to-end path over
+performance. Each frame is fetched with `grim` and pushed into an `appsrc` before
+OpenH264 encoding. The next media checkpoint keeps the same WebRTC contract but
+uses persistent wlroots screencopy buffers and GPU-backed encoding where
+available.
