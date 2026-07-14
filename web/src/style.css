@@ -87,6 +87,13 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 }
 .desktop-frame:focus { border-color: #71864a; box-shadow: 0 0 0 1px rgba(199,255,74,.18), 0 25px 80px rgba(0,0,0,.45); }
 .desktop-frame video { width: 100%; height: 100%; display: block; object-fit: contain; background: #050608; }
+.remote-pointer {
+  position: absolute; z-index: 5; width: 18px; height: 25px; pointer-events: none;
+  background: var(--acid); transform: translate(-2px, -2px);
+  clip-path: polygon(0 0, 0 83%, 24% 63%, 39% 100%, 57% 92%, 42% 58%, 72% 58%);
+  filter: drop-shadow(0 0 2px #050608) drop-shadow(0 0 5px rgba(199,255,74,.8));
+}
+.remote-pointer[hidden] { display: none; }
 .desktop-empty {
   position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
   justify-content: center; gap: 14px; padding: 30px; text-align: center;

@@ -44,6 +44,8 @@ let remoteCandidates: RTCIceCandidateInit[] = [];
 let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
 let desktopControlActive = false;
+let desktopPointerX = 0;
+let desktopPointerY = 0;
 
 function gateShell(content: string): string {
   return `
@@ -156,6 +158,7 @@ async function renderDesktop(): Promise<void> {
       </div>
       <div class="desktop-frame" id="desktop-frame" tabindex="0">
         <video id="desktop-video" autoplay playsinline muted></video>
+        <span id="remote-pointer" class="remote-pointer" aria-hidden="true" hidden></span>
         <div class="desktop-empty" id="desktop-empty">
           <span class="brand-mark large" aria-hidden="true"><i></i></span>
           <strong>Virtual Wayland output offline</strong>
@@ -363,6 +366,9 @@ function connectDesktop(): void {
 
 function markDesktopVideoReady(): void {
   desktopVideoReady = true;
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  desktopPointerX = (video?.videoWidth || 1280) / 2;
+  desktopPointerY = (video?.videoHeight || 720) / 2;
   if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
   desktopNegotiationTimer = null;
   hideDesktopMessage();
@@ -376,21 +382,32 @@ function installDesktopInput(): void {
   frame.addEventListener("pointermove", (event) => {
     if (!desktopControlActive) return;
     if (document.pointerLockElement === frame) {
+      moveRemotePointer(event.movementX, event.movementY);
       sendDesktopInput({ type: "pointer_delta", dx: event.movementX, dy: event.movementY });
       return;
     }
-    const rect = video.getBoundingClientRect();
-    if (!rect.width || !rect.height) return;
+    const position = remotePositionFromClient(event.clientX, event.clientY);
+    if (!position) return;
+    desktopPointerX = position.x;
+    desktopPointerY = position.y;
+    renderRemotePointer();
     sendDesktopInput({
       type: "pointer_move",
-      x: ((event.clientX - rect.left) / rect.width) * (video.videoWidth || 1280),
-      y: ((event.clientY - rect.top) / rect.height) * (video.videoHeight || 720),
+      x: desktopPointerX,
+      y: desktopPointerY,
     });
   });
   frame.addEventListener("pointerdown", (event) => {
     if (!desktopVideoReady) return;
     event.preventDefault();
+    const position = remotePositionFromClient(event.clientX, event.clientY);
+    if (position) {
+      desktopPointerX = position.x;
+      desktopPointerY = position.y;
+      sendDesktopInput({ type: "pointer_move", x: desktopPointerX, y: desktopPointerY });
+    }
     desktopControlActive = true;
+    renderRemotePointer();
     frame.focus();
     if (document.pointerLockElement !== frame) frame.requestPointerLock();
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
@@ -432,6 +449,7 @@ function desktopPointerLockChange(): void {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
   if (frame && document.pointerLockElement === frame) {
     desktopControlActive = true;
+    renderRemotePointer();
     setDesktopState("CONTROL / ESC TO EXIT");
   } else if (desktopControlActive) {
     releaseDesktopControl(false);
@@ -446,7 +464,59 @@ function releaseDesktopControl(exitPointerLock = true): void {
   }
   if (exitPointerLock && document.pointerLockElement) document.exitPointerLock();
   document.querySelector<HTMLDivElement>("#desktop-frame")?.blur();
+  const pointer = document.querySelector<HTMLElement>("#remote-pointer");
+  if (pointer) pointer.hidden = true;
   setDesktopState("LIVE");
+}
+
+function remoteVideoMetrics(): { left: number; top: number; width: number; height: number; sourceWidth: number; sourceHeight: number } | null {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  if (!frame || !video) return null;
+  const sourceWidth = video.videoWidth || 1280;
+  const sourceHeight = video.videoHeight || 720;
+  const frameWidth = frame.clientWidth;
+  const frameHeight = frame.clientHeight;
+  if (!frameWidth || !frameHeight) return null;
+  const scale = Math.min(frameWidth / sourceWidth, frameHeight / sourceHeight);
+  const width = sourceWidth * scale;
+  const height = sourceHeight * scale;
+  return {
+    left: (frameWidth - width) / 2,
+    top: (frameHeight - height) / 2,
+    width,
+    height,
+    sourceWidth,
+    sourceHeight,
+  };
+}
+
+function remotePositionFromClient(clientX: number, clientY: number): { x: number; y: number } | null {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  const metrics = remoteVideoMetrics();
+  if (!frame || !metrics) return null;
+  const rect = frame.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(metrics.sourceWidth - 1, ((clientX - rect.left - metrics.left) / metrics.width) * metrics.sourceWidth)),
+    y: Math.max(0, Math.min(metrics.sourceHeight - 1, ((clientY - rect.top - metrics.top) / metrics.height) * metrics.sourceHeight)),
+  };
+}
+
+function moveRemotePointer(dx: number, dy: number): void {
+  const metrics = remoteVideoMetrics();
+  if (!metrics) return;
+  desktopPointerX = Math.max(0, Math.min(metrics.sourceWidth - 1, desktopPointerX + dx));
+  desktopPointerY = Math.max(0, Math.min(metrics.sourceHeight - 1, desktopPointerY + dy));
+  renderRemotePointer();
+}
+
+function renderRemotePointer(): void {
+  const pointer = document.querySelector<HTMLElement>("#remote-pointer");
+  const metrics = remoteVideoMetrics();
+  if (!pointer || !metrics || !desktopControlActive) return;
+  pointer.style.left = `${metrics.left + (desktopPointerX / metrics.sourceWidth) * metrics.width}px`;
+  pointer.style.top = `${metrics.top + (desktopPointerY / metrics.sourceHeight) * metrics.height}px`;
+  pointer.hidden = false;
 }
 
 function sendDesktopInput(message: Record<string, unknown>): void {
