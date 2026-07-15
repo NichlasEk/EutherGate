@@ -34,6 +34,14 @@ type DesktopTransportProfile = {
   urls: string[];
 };
 
+type VncPerformanceProfile = {
+  id: "compatible" | "smooth" | "gpu";
+  label: string;
+  description: string;
+  fps: number;
+  gpu: boolean;
+};
+
 type DesktopOutput = {
   id: string;
   name: string;
@@ -81,6 +89,7 @@ let vnc: RFB | null = null;
 let desktopFallbackFrameUrl: string | null = null;
 let desktopNegotiationTimer: number | null = null;
 let desktopVncRetryTimer: number | null = null;
+let vncSuperHeld = false;
 let desktopControlActive = false;
 let desktopIceCandidates: string[] = [];
 let desktopIceErrors: string[] = [];
@@ -91,6 +100,31 @@ let remoteClipboardBlob: Blob | null = null;
 
 const clipboardLimit = 8 * 1024 * 1024;
 const transportPreferenceKey = "euthergate.transport-profile";
+const vncProfilePreferenceKey = "euthergate.vnc-performance-profile";
+const remoteSuperKeysym = 0xffeb;
+const vncPerformanceProfiles: VncPerformanceProfile[] = [
+  {
+    id: "compatible",
+    label: "VNC · 30 FPS",
+    description: "Compatible RFB mode capped at 30 FPS.",
+    fps: 30,
+    gpu: false,
+  },
+  {
+    id: "smooth",
+    label: "VNC · 60 FPS",
+    description: "RFB mode capped at 60 FPS; higher CPU and network use.",
+    fps: 60,
+    gpu: false,
+  },
+  {
+    id: "gpu",
+    label: "VNC · 60 FPS + GPU",
+    description: "60 FPS with WayVNC GPU features and H.264 when the browser supports it.",
+    fps: 60,
+    gpu: true,
+  },
+];
 
 const gateRoot = new URL("./", document.baseURI);
 
@@ -277,6 +311,7 @@ async function renderDesktop(): Promise<void> {
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <select id="desktop-output-picker" class="output-picker" aria-label="Wayland output" disabled></select>
           <select id="desktop-transport-picker" class="output-picker transport-picker" aria-label="Connection protocol" disabled></select>
+          <select id="desktop-vnc-profile-picker" class="output-picker vnc-profile-picker" aria-label="VNC performance" hidden></select>
           <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
           <button id="desktop-clipboard" class="ghost-button" type="button" disabled>CLIPBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
@@ -317,7 +352,7 @@ async function renderDesktop(): Promise<void> {
         </div>
       </div>
       <div class="desktop-footer">
-        <span>Click to enter remote control · Esc returns to the local desktop.</span>
+        <span>Click to enter remote control · Esc returns locally · VNC: hold F8 for remote Super.</span>
         <span id="desktop-mode">1280×720 @ 30</span>
       </div>
       <div class="desktop-network" aria-live="polite">
@@ -333,6 +368,7 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
   document.querySelector<HTMLSelectElement>("#desktop-transport-picker")?.addEventListener("change", switchDesktopTransport);
+  document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker")?.addEventListener("change", switchVncPerformanceProfile);
   installClipboardBridge();
   installDesktopInput();
 
@@ -382,6 +418,7 @@ function updateDesktopStatus(status: DesktopStatus): void {
     transportPicker.disabled = desktopTransportProfiles.length < 2;
     transportPicker.title = selectedTransportProfile()?.description || "Connection protocol";
   }
+  updateVncPerformancePicker();
   const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
   if (terminalButton) terminalButton.disabled = !status.active;
   const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
@@ -456,6 +493,7 @@ async function switchDesktopTransport(): Promise<void> {
   if (!picker) return;
   saveTransportPreference(picker.value);
   picker.title = selectedTransportProfile()?.description || "Connection protocol";
+  updateVncPerformancePicker();
   resetIceDiagnostics();
   if (!power || power.dataset.active !== "true") return;
   picker.disabled = true;
@@ -463,6 +501,22 @@ async function switchDesktopTransport(): Promise<void> {
   disposeDesktop();
   await new Promise((resolve) => window.setTimeout(resolve, 250));
   connectDesktop();
+  picker.disabled = false;
+}
+
+async function switchVncPerformanceProfile(): Promise<void> {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker");
+  const power = document.querySelector<HTMLButtonElement>("#desktop-power");
+  if (!picker) return;
+  saveVncProfilePreference(picker.value);
+  picker.title = selectedVncPerformanceProfile().description;
+  updateIceDiagnostics();
+  if (!power || power.dataset.active !== "true" || selectedTransportProfile()?.id !== "vnc-wss") return;
+  picker.disabled = true;
+  setDesktopState("CHANGING VNC PROFILE");
+  disposeDesktop();
+  await new Promise((resolve) => window.setTimeout(resolve, 250));
+  connectVncDesktop();
   picker.disabled = false;
 }
 
@@ -796,6 +850,7 @@ function connectDesktop(): void {
 function connectVncDesktop(attempt = 0): void {
   desktopVncActive = true;
   activeDesktopIceServers = [];
+  const performance = selectedVncPerformanceProfile();
   const video = document.querySelector<HTMLVideoElement>("#desktop-video");
   const target = document.querySelector<HTMLDivElement>("#desktop-vnc");
   if (!target) {
@@ -806,6 +861,9 @@ function connectVncDesktop(attempt = 0): void {
   target.hidden = false;
   updateIceDiagnostics();
   setDesktopState("CONNECTING VNC/WSS");
+  window.addEventListener("keydown", vncSuperKeyEvent, { capture: true });
+  window.addEventListener("keyup", vncSuperKeyEvent, { capture: true });
+  window.addEventListener("blur", releaseVncSuperKey);
 
   // noVNC measures its target when scaleViewport is enabled. Wait until the
   // previously hidden target has a definite laid-out size before constructing
@@ -813,7 +871,9 @@ function connectVncDesktop(attempt = 0): void {
   window.requestAnimationFrame(() => {
     if (!desktopVncActive || !target.isConnected) return;
     target.replaceChildren();
-    const session = new RFB(target, gateWebSocket("ws/desktop-vnc").toString(), { shared: false });
+    const vncUrl = gateWebSocket("ws/desktop-vnc");
+    vncUrl.searchParams.set("profile", performance.id);
+    const session = new RFB(target, vncUrl.toString(), { shared: false });
     vnc = session;
     session.background = "#050608";
     session.scaleViewport = true;
@@ -826,7 +886,7 @@ function connectVncDesktop(attempt = 0): void {
       hideDesktopMessage();
       setDesktopState("LIVE");
       const transport = document.querySelector<HTMLElement>("#desktop-transport");
-      if (transport) transport.textContent = "RFB / WSS";
+      if (transport) transport.textContent = `RFB ${performance.fps} FPS${performance.gpu ? " GPU/H.264" : ""} / WSS`;
       session.focus();
     });
     session.addEventListener("disconnect", (event) => {
@@ -960,6 +1020,42 @@ function saveTransportPreference(profile: string): void {
   }
 }
 
+function selectedVncPerformanceProfile(): VncPerformanceProfile {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker");
+  const id = picker?.value || loadVncProfilePreference();
+  return vncPerformanceProfiles.find((profile) => profile.id === id) || vncPerformanceProfiles[0];
+}
+
+function loadVncProfilePreference(): string {
+  try {
+    return window.localStorage.getItem(vncProfilePreferenceKey) || "compatible";
+  } catch {
+    return "compatible";
+  }
+}
+
+function saveVncProfilePreference(profile: string): void {
+  try {
+    window.localStorage.setItem(vncProfilePreferenceKey, profile);
+  } catch {
+    // The selected profile remains active even when local storage is unavailable.
+  }
+}
+
+function updateVncPerformancePicker(): void {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker");
+  if (!picker) return;
+  const visible = selectedTransportProfile()?.id === "vnc-wss";
+  const preferred = loadVncProfilePreference();
+  const selected = vncPerformanceProfiles.some((profile) => profile.id === preferred) ? preferred : "compatible";
+  picker.innerHTML = vncPerformanceProfiles.map((profile) =>
+    `<option value="${profile.id}" title="${escapeHtml(profile.description)}"${profile.id === selected ? " selected" : ""}>${escapeHtml(profile.label)}</option>`
+  ).join("");
+  picker.hidden = !visible;
+  picker.disabled = !visible;
+  picker.title = selectedVncPerformanceProfile().description;
+}
+
 function describeIceUrl(url: string): string {
   if (!url) return "unknown ICE server";
   const match = url.match(/^(turns?):(?:[^@]+@)?([^?]+)(?:\?transport=([^&]+))?/i);
@@ -981,9 +1077,10 @@ function updateIceDiagnostics(): void {
   const route = document.querySelector<HTMLElement>("#desktop-ice-route");
   const detail = document.querySelector<HTMLElement>("#desktop-ice-detail");
   if (desktopVncActive) {
+    const performance = selectedVncPerformanceProfile();
     if (route) route.textContent = "STREAM ROUTE · authenticated VNC/WSS";
     if (detail) {
-      detail.textContent = "RFB · private WayVNC Unix socket + WebSocket/TCP 443";
+      detail.textContent = `RFB · ${performance.fps} FPS${performance.gpu ? " + GPU/H.264 when supported" : ""} · private WayVNC Unix socket + WebSocket/TCP 443 · F8 = SUPER`;
       detail.classList.remove("error");
     }
     return;
@@ -1121,6 +1218,25 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     shift: event.shiftKey,
     meta: event.metaKey,
   });
+}
+
+function vncSuperKeyEvent(event: KeyboardEvent): void {
+  if (!desktopVncActive || !desktopVideoReady || event.code !== "F8" || !vnc) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  if (event.type === "keydown") {
+    if (vncSuperHeld || event.repeat) return;
+    vncSuperHeld = true;
+    vnc.sendKey(remoteSuperKeysym, "MetaLeft", true);
+  } else {
+    releaseVncSuperKey();
+  }
+}
+
+function releaseVncSuperKey(): void {
+  if (!vncSuperHeld) return;
+  vncSuperHeld = false;
+  vnc?.sendKey(remoteSuperKeysym, "MetaLeft", false);
 }
 
 function desktopPointerLockChange(): void {
@@ -1321,6 +1437,10 @@ function disposeTerminal(): void {
 }
 
 function disposeDesktop(): void {
+  releaseVncSuperKey();
+  window.removeEventListener("keydown", vncSuperKeyEvent, { capture: true });
+  window.removeEventListener("keyup", vncSuperKeyEvent, { capture: true });
+  window.removeEventListener("blur", releaseVncSuperKey);
   releaseDesktopControl();
   closeClipboardPanel();
   clearClipboardPreview();

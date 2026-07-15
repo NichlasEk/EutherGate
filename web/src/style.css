@@ -69,6 +69,7 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 .output-picker:focus { outline: 1px solid var(--acid); outline-offset: 1px; }
 .output-picker:disabled { opacity: .45; }
 .transport-picker { max-width: 205px; border-color: #4b5838; color: var(--acid); }
+.vnc-profile-picker { max-width: 190px; border-color: #596746; color: #d9f5a2; }
 .primary-action { color: var(--acid); border-color: #53672c; }
 .primary-action:hover { color: #e3ff9d; border-color: var(--acid); }
 .primary-action:disabled { cursor: wait; opacity: .5; }
@@ -174,5 +175,6 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   .desktop-network span:last-child { text-align: left; }
   .output-picker { max-width: 145px; }
   .transport-picker { max-width: 170px; }
+  .vnc-profile-picker { max-width: 160px; }
   #desktop-terminal { display: none; }
 }

@@ -90,6 +90,7 @@ struct DesktopManager {
     helper: PathBuf,
     fallback_helper: PathBuf,
     wayvnc: Option<PathBuf>,
+    vnc_keyboard: String,
 }
 
 #[derive(Clone)]
@@ -174,6 +175,48 @@ struct TransportProfile {
     description: &'static str,
     ice_transport_policy: &'static str,
     urls: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VncPerformanceProfile {
+    Compatible,
+    Smooth,
+    Gpu,
+}
+
+#[derive(Deserialize)]
+struct VncProfileQuery {
+    profile: Option<String>,
+}
+
+impl VncPerformanceProfile {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.unwrap_or("compatible") {
+            "compatible" => Some(Self::Compatible),
+            "smooth" => Some(Self::Smooth),
+            "gpu" => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Smooth => "smooth",
+            Self::Gpu => "gpu",
+        }
+    }
+
+    fn max_fps(self) -> &'static str {
+        match self {
+            Self::Compatible => "30",
+            Self::Smooth | Self::Gpu => "60",
+        }
+    }
+
+    fn gpu(self) -> bool {
+        self == Self::Gpu
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -306,6 +349,7 @@ async fn main() -> Result<()> {
             helper: config.desktop_helper.clone(),
             fallback_helper: config.desktop_fallback_helper.clone(),
             wayvnc: config.wayvnc.clone(),
+            vnc_keyboard: config.vnc_keyboard.clone(),
         }),
     };
 
@@ -370,6 +414,7 @@ struct Config {
     desktop_helper: PathBuf,
     desktop_fallback_helper: PathBuf,
     wayvnc: Option<PathBuf>,
+    vnc_keyboard: String,
     forge_session_file: PathBuf,
     terminal_upload_dir: PathBuf,
 }
@@ -447,6 +492,10 @@ impl Config {
             .map(PathBuf::from)
             .map(|path| resolve_executable(&path))
             .unwrap_or_else(|| resolve_executable(Path::new("wayvnc")));
+        let vnc_keyboard = env::var("EUTHERGATE_VNC_KEYBOARD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "se".into());
         let forge_session_file = env::var_os("EUTHERGATE_FORGE_SESSION_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -479,6 +528,7 @@ impl Config {
             desktop_helper,
             desktop_fallback_helper,
             wayvnc,
+            vnc_keyboard,
             forge_session_file,
             terminal_upload_dir,
         })
@@ -1127,6 +1177,7 @@ async fn desktop_vnc_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<VncProfileQuery>,
 ) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -1137,6 +1188,13 @@ async fn desktop_vnc_ws(
     if state.desktop.wayvnc.is_none() {
         return (StatusCode::SERVICE_UNAVAILABLE, "WayVNC is unavailable").into_response();
     }
+    let Some(profile) = VncPerformanceProfile::parse(query.profile.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "unknown VNC profile; expected compatible, smooth or gpu",
+        )
+            .into_response();
+    };
     if state
         .desktop
         .viewer_connected
@@ -1153,7 +1211,7 @@ async fn desktop_vnc_ws(
     ws.max_message_size(16 * 1024 * 1024)
         .max_frame_size(16 * 1024 * 1024)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = desktop_vnc_socket(socket, desktop.clone()).await {
+            if let Err(error) = desktop_vnc_socket(socket, desktop.clone(), profile).await {
                 error!(%error, "desktop VNC/WSS bridge stopped");
             }
             desktop.viewer_connected.store(false, Ordering::Release);
@@ -1984,7 +2042,11 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
     Ok(())
 }
 
-async fn desktop_vnc_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+async fn desktop_vnc_socket(
+    socket: WebSocket,
+    desktop: Arc<DesktopManager>,
+    profile: VncPerformanceProfile,
+) -> Result<()> {
     let selection = desktop.selection();
     let (wayland_display, backend_environment) = match &selection.backend {
         DesktopBackend::Hyprland {
@@ -2016,12 +2078,20 @@ async fn desktop_vnc_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> 
     let mut command = Command::new(wayvnc);
     command
         .args(["--exit-on-disconnect", "--unix-socket"])
+        .arg("--max-fps")
+        .arg(profile.max_fps())
         .arg("--output")
         .arg(&selection.capture_output)
         .arg("--socket")
         .arg(&control_socket)
         .arg("--name")
         .arg("EutherGate Forge")
+        .arg("--keyboard")
+        .arg(&desktop.vnc_keyboard);
+    if profile.gpu() {
+        command.arg("--gpu");
+    }
+    command
         .arg(&rfb_socket)
         .env("WAYLAND_DISPLAY", wayland_display)
         .stdin(Stdio::null())
@@ -2034,6 +2104,13 @@ async fn desktop_vnc_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> 
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start {}", wayvnc.display()))?;
+    info!(
+        profile = profile.id(),
+        max_fps = profile.max_fps(),
+        gpu = profile.gpu(),
+        output = %selection.capture_output,
+        "VNC performance profile started"
+    );
 
     let connect_result = timeout(Duration::from_secs(4), async {
         loop {
@@ -2516,6 +2593,23 @@ mod tests {
                 .iter()
                 .any(|profile| profile.id == "vnc-wss")
         );
+    }
+
+    #[test]
+    fn vnc_performance_profiles_are_strict_and_bounded() {
+        let compatible = VncPerformanceProfile::parse(None).unwrap();
+        assert_eq!(compatible, VncPerformanceProfile::Compatible);
+        assert_eq!(compatible.max_fps(), "30");
+        assert!(!compatible.gpu());
+
+        let smooth = VncPerformanceProfile::parse(Some("smooth")).unwrap();
+        assert_eq!(smooth.max_fps(), "60");
+        assert!(!smooth.gpu());
+
+        let gpu = VncPerformanceProfile::parse(Some("gpu")).unwrap();
+        assert_eq!(gpu.max_fps(), "60");
+        assert!(gpu.gpu());
+        assert!(VncPerformanceProfile::parse(Some("120")).is_none());
     }
 
     #[test]

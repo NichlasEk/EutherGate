@@ -153,6 +153,7 @@ WebSocket upstream requests.
 | `EUTHERGATE_DESKTOP_MODE` | `1280x720@30` | Virtual output resolution and frame rate. |
 | `EUTHERGATE_DESKTOP_HELPER` | `scripts/webrtc_desktop.py` | GStreamer media helper. |
 | `EUTHERGATE_WAYVNC_BIN` | discovered from `PATH` | Optional WayVNC executable for authenticated VNC/WSS. |
+| `EUTHERGATE_VNC_KEYBOARD` | `se` | XKB layout used by WayVNC input; the Swedish default includes `å`, `ä` and `ö`. |
 | `EUTHERGATE_FORGE_SESSION_FILE` | `$XDG_RUNTIME_DIR/euthergate-forge/session.env` | Runtime descriptor for the persistent Forge compositor. |
 | `EUTHERGATE_TERMINAL_UPLOAD_DIR` | `/tmp/euthergate-<uid>/terminal-images` | Private directory for images pasted into Gate Shell. |
 | `EUTHERGATE_SECURE_COOKIE` | `false` | Add `Secure` to the auth cookie. Enable behind HTTPS. |
@@ -188,6 +189,13 @@ encodings and native Wayland input, making it the first performance alternative
 to the full-frame JPEG fallback on HTTPS-only networks. While a VNC viewer is
 connected, EutherGate wakes the selected output and holds an idle inhibitor so
 Hyprland or Sway cannot pause capture by powering that output off.
+
+When `WORK · VNC/WSS` is selected, a second picker chooses between compatible
+30 FPS, 60 FPS, and 60 FPS with WayVNC GPU features. The GPU profile negotiates
+H.264 when noVNC and the browser expose WebCodecs support and otherwise retains
+the normal RFB encodings. On Windows clients, hold `F8` as the remote Super key;
+this avoids the local operating system consuming the Windows key before the
+browser can forward it.
 
 Never expose this checkpoint directly to the public internet. Put it behind TLS
 and a trusted access layer. A VPN such as Tailscale is currently the simplest
