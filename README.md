@@ -79,6 +79,11 @@ session. EutherGate asks Hypridle to stay idle-inhibited for two minutes so a
 locked screen does not immediately switch off again. Hyprlock remains locked;
 the action never enters a password or unlocks the session.
 
+The authenticated EutherOxide server map can also schedule restarts of the
+gateway, reverse tunnel and persistent Forge compositor. The API accepts only
+the fixed `gateway`, `tunnel` and `forge` service names; restart jobs are delayed
+briefly so the proxy response can finish before a service or tunnel goes down.
+
 Click the streamed desktop to enter remote control. The browser locks the
 pointer for relative movement; press **Esc** to leave remote control and return
 the host cursor to the position it had before control began.

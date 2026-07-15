@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        DefaultBodyLimit, Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -157,6 +157,13 @@ struct DisplayWakeResponse {
     hold_seconds: u64,
 }
 
+#[derive(Serialize)]
+struct ServiceRestartResponse {
+    service: String,
+    unit: &'static str,
+    scheduled_seconds: u64,
+}
+
 #[derive(Deserialize)]
 struct HyprMonitor {
     name: String,
@@ -258,6 +265,7 @@ async fn main() -> Result<()> {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/displays/wake", post(display_wake))
+        .route("/api/services/{service}/restart", post(service_restart))
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -600,6 +608,83 @@ async fn display_wake(State(state): State<AppState>, headers: HeaderMap) -> Resp
             )
                 .into_response()
         }
+    }
+}
+
+async fn service_restart(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(service): AxumPath<String>,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let Some(unit) = restart_unit_for_service(&service) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown EutherGate service" })),
+        )
+            .into_response();
+    };
+    let timer_unit = format!(
+        "euthergate-remote-restart-{}-{}",
+        service,
+        random_secret(6).replace('_', "-")
+    );
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--on-active=2s",
+            "--unit",
+            &timer_unit,
+            "/usr/bin/systemctl",
+            "--user",
+            "restart",
+            unit,
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            info!(service, unit, "scheduled remote service restart");
+            (
+                StatusCode::ACCEPTED,
+                Json(ServiceRestartResponse {
+                    service,
+                    unit,
+                    scheduled_seconds: 2,
+                }),
+            )
+                .into_response()
+        }
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            warn!(service, unit, %detail, "could not schedule remote service restart");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": detail })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            warn!(service, unit, %error, "could not launch systemd-run");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn restart_unit_for_service(service: &str) -> Option<&'static str> {
+    match service {
+        "gateway" => Some("euthergate.service"),
+        "tunnel" => Some("euthergate-tunnel.service"),
+        "forge" => Some("euthergate-forge.service"),
+        _ => None,
     }
 }
 
@@ -1606,6 +1691,24 @@ mod tests {
         headers.insert(PROXY_AUTH_HEADER, HeaderValue::from_static("oxide-secret"));
         assert!(proxy_token_authenticated(&headers, Some(&expected)));
         assert!(!proxy_token_authenticated(&headers, None));
+    }
+
+    #[test]
+    fn remote_service_restart_is_strictly_allowlisted() {
+        assert_eq!(
+            restart_unit_for_service("gateway"),
+            Some("euthergate.service")
+        );
+        assert_eq!(
+            restart_unit_for_service("tunnel"),
+            Some("euthergate-tunnel.service")
+        );
+        assert_eq!(
+            restart_unit_for_service("forge"),
+            Some("euthergate-forge.service")
+        );
+        assert_eq!(restart_unit_for_service("eutherhost"), None);
+        assert_eq!(restart_unit_for_service("../../anything"), None);
     }
 
     #[test]
