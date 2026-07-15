@@ -13,6 +13,7 @@ type DesktopStatus = {
   available: boolean;
   active: boolean;
   viewer_connected: boolean;
+  output_id: string;
   output: string;
   mode: string;
   workspace: number;
@@ -23,6 +24,7 @@ type DesktopStatus = {
 };
 
 type DesktopOutput = {
+  id: string;
   name: string;
   description: string;
   mode: string;
@@ -221,10 +223,8 @@ function updateDesktopStatus(status: DesktopStatus): void {
   const picker = document.querySelector<HTMLSelectElement>("#desktop-output-picker");
   if (picker) {
     picker.innerHTML = status.outputs.map((candidate) => {
-      const label = candidate.virtual_output
-        ? `${candidate.name} — Virtual Forge`
-        : `${candidate.name} — ${candidate.description}`;
-      return `<option value="${escapeHtml(candidate.name)}"${candidate.name === status.output ? " selected" : ""}>${escapeHtml(label)}</option>`;
+      const label = `${candidate.name} — ${candidate.description}`;
+      return `<option value="${escapeHtml(candidate.id)}"${candidate.id === status.output_id ? " selected" : ""}>${escapeHtml(label)}</option>`;
     }).join("");
     picker.disabled = false;
   }

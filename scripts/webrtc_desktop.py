@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""GStreamer WebRTC bridge for one Hyprland headless output.
+"""GStreamer WebRTC bridge for one EutherGate Wayland output.
 
 Signaling is newline-delimited JSON on stdin/stdout. Desktop input arrives on a
-WebRTC DataChannel and is injected through Hyprland IPC in this first slice.
+WebRTC DataChannel and is injected through compositor-local IPC.
 """
 
 from __future__ import annotations
@@ -48,7 +48,8 @@ def parse_mode(value: str) -> Mode:
 
 
 class DesktopBridge:
-    def __init__(self, output: str, mode: Mode) -> None:
+    def __init__(self, backend: str, output: str, mode: Mode) -> None:
+        self.backend = backend
         self.output = output
         self.mode = mode
         self.loop = GLib.MainLoop()
@@ -207,7 +208,7 @@ class DesktopBridge:
             time.sleep(max(0, next_frame - time.monotonic()))
 
     def _input_loop(self) -> None:
-        controller = InputController(self.output, self.mode)
+        controller = InputController(self.backend, self.output, self.mode)
         deferred: dict | None = None
         while self.running.is_set():
             try:
@@ -290,48 +291,64 @@ def offered_video_payload(sdp: str, codec: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def output_geometry(output: str) -> tuple[int, int]:
+def output_geometry(backend: str, output: str) -> tuple[int, int]:
+    command = ["hyprctl", "monitors", "all", "-j"] if backend == "hyprland" else ["swaymsg", "-t", "get_outputs", "-r"]
     result = subprocess.run(
-        ["hyprctl", "monitors", "all", "-j"],
+        command,
         check=True,
         capture_output=True,
         text=True,
         timeout=2,
     )
     monitor = next(item for item in json.loads(result.stdout) if item["name"] == output)
-    return int(monitor["x"]), int(monitor["y"])
+    if backend == "hyprland":
+        return int(monitor["x"]), int(monitor["y"])
+    return int(monitor["rect"]["x"]), int(monitor["rect"]["y"])
 
 
 class InputController:
-    def __init__(self, output: str, mode: Mode) -> None:
-        self.geometry = output_geometry(output)
+    def __init__(self, backend: str, output: str, mode: Mode) -> None:
+        self.backend = backend
+        self.geometry = output_geometry(backend, output)
         self.mode = mode
-        self.return_position = cursor_position()
+        self.return_position = cursor_position() if backend == "hyprland" else (0, 0)
         self.remote_x = mode.width / 2
         self.remote_y = mode.height / 2
 
     def inject(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "release_control":
-            run_hyprctl(
-                "dispatch",
-                "movecursor",
-                str(self.return_position[0]),
-                str(self.return_position[1]),
-            )
+            if self.backend == "hyprland":
+                run_hyprctl(
+                    "dispatch",
+                    "movecursor",
+                    str(self.return_position[0]),
+                    str(self.return_position[1]),
+                )
         elif kind == "pointer_move":
             self.update_pointer(event)
             self.flush_pointer()
         elif kind == "pointer_delta":
             self.update_pointer(event)
             self.flush_pointer()
-        elif kind == "pointer_button" and event.get("state") == "pressed":
-            button = {0: 272, 1: 274, 2: 273}.get(int(event.get("button", 0)))
-            if button:
-                run_hyprctl("dispatch", "sendshortcut", f",mouse:{button}")
+        elif kind == "pointer_button":
+            if self.backend == "hyprland" and event.get("state") == "pressed":
+                button = {0: 272, 1: 274, 2: 273}.get(int(event.get("button", 0)))
+                if button:
+                    run_hyprctl("dispatch", "sendshortcut", f",mouse:{button}")
+            elif self.backend == "sway":
+                button = {0: "button1", 1: "button3", 2: "button2"}.get(int(event.get("button", 0)))
+                if button:
+                    state = "press" if event.get("state") == "pressed" else "release"
+                    run_swaymsg("seat", "seat0", "cursor", state, button)
         elif kind == "wheel":
-            key = "pagedown" if float(event.get("dy", 0)) > 0 else "pageup"
-            run_hyprctl("dispatch", "sendshortcut", f",{key}")
+            if self.backend == "hyprland":
+                key = "pagedown" if float(event.get("dy", 0)) > 0 else "pageup"
+                run_hyprctl("dispatch", "sendshortcut", f",{key}")
+            else:
+                button = "button5" if float(event.get("dy", 0)) > 0 else "button4"
+                run_swaymsg("seat", "seat0", "cursor", "press", button)
+                run_swaymsg("seat", "seat0", "cursor", "release", button)
         elif kind == "key" and event.get("state") == "pressed" and not event.get("repeat"):
             key = browser_key(event.get("code", ""))
             if not key:
@@ -345,7 +362,10 @@ class InputController:
                 modifiers.append("SHIFT")
             if event.get("meta"):
                 modifiers.append("SUPER")
-            run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
+            if self.backend == "hyprland":
+                run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
+            else:
+                run_wtype(key, modifiers)
 
     def update_pointer(self, event: dict) -> None:
         if event.get("type") == "pointer_move":
@@ -360,7 +380,10 @@ class InputController:
         self.remote_y = max(0, min(self.mode.height - 1, self.remote_y))
         x = self.geometry[0] + round(self.remote_x)
         y = self.geometry[1] + round(self.remote_y)
-        run_hyprctl("dispatch", "movecursor", str(x), str(y))
+        if self.backend == "hyprland":
+            run_hyprctl("dispatch", "movecursor", str(x), str(y))
+        else:
+            run_swaymsg("seat", "seat0", "cursor", "set", str(x), str(y))
 
 
 def cursor_position() -> tuple[int, int]:
@@ -422,12 +445,44 @@ def run_hyprctl(*args: str) -> None:
     )
 
 
+def run_swaymsg(*args: str) -> None:
+    subprocess.run(
+        ["swaymsg", *args],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=1,
+    )
+
+
+def run_wtype(key: str, modifiers: list[str]) -> None:
+    modifier_names = {"CTRL": "ctrl", "ALT": "alt", "SHIFT": "shift", "SUPER": "logo"}
+    command = ["wtype"]
+    for modifier in modifiers:
+        command.extend(["-M", modifier_names[modifier]])
+    command.extend(["-k", sway_key(key)])
+    for modifier in reversed(modifiers):
+        command.extend(["-m", modifier_names[modifier]])
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1)
+
+
+def sway_key(key: str) -> str:
+    mapping = {
+        "return": "Return", "escape": "Escape", "backspace": "BackSpace",
+        "delete": "Delete", "insert": "Insert", "home": "Home", "end": "End",
+        "pageup": "Page_Up", "pagedown": "Page_Down", "up": "Up", "down": "Down",
+        "left": "Left", "right": "Right", "space": "space", "tab": "Tab",
+    }
+    return mapping.get(key, key)
+
+
 def emit(message: dict) -> None:
     print(json.dumps(message, separators=(",", ":")), flush=True)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("hyprland", "sway"), default="hyprland")
     parser.add_argument("--output", required=True)
     parser.add_argument("--mode", default="1280x720@30")
     parser.add_argument("--probe", action="store_true")
@@ -435,7 +490,7 @@ def main() -> int:
     mode = parse_mode(args.mode)
 
     Gst.init(None)
-    bridge = DesktopBridge(args.output, mode)
+    bridge = DesktopBridge(args.backend, args.output, mode)
     if args.probe:
         print("ok: GStreamer WebRTC/VP8 pipeline is available")
         bridge.pipeline.set_state(Gst.State.NULL)

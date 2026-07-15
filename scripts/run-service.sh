@@ -10,15 +10,20 @@ source .env
 set +a
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-    socket="$(find "$runtime_dir/hypr" -mindepth 2 -maxdepth 2 -name .socket.sock -printf '%T@ %h\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
-    if [[ -n "$socket" ]]; then
-        export HYPRLAND_INSTANCE_SIGNATURE="${socket##*/}"
-    fi
-fi
-if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
-    wayland_socket="$(find "$runtime_dir" -maxdepth 1 -type s -name 'wayland-*' -printf '%T@ %f\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
-    export WAYLAND_DISPLAY="${wayland_socket:-wayland-1}"
+forge_session="$runtime_dir/euthergate-forge/session.env"
+for _ in $(seq 1 100); do
+    [[ -r "$forge_session" ]] && break
+    sleep 0.05
+done
+if [[ -r "$forge_session" ]]; then
+    while IFS='=' read -r key value; do
+        case "$key" in
+            WAYLAND_DISPLAY|SWAYSOCK) export "$key=$value" ;;
+        esac
+    done < "$forge_session"
+    export XDG_CURRENT_DESKTOP=sway
+    export XDG_SESSION_DESKTOP=euthergate-forge
+    export XDG_SESSION_TYPE=wayland
 fi
 
 exec "$ROOT_DIR/target/release/euthergate"

@@ -3,7 +3,8 @@ use std::{
     env,
     io::{Read, Write},
     net::SocketAddr,
-    path::PathBuf,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex as StdMutex},
@@ -65,16 +66,41 @@ struct DesktopManager {
     viewer_connected: AtomicBool,
     headless_output: String,
     headless_mode: String,
+    forge_session_file: PathBuf,
     selection: StdMutex<DesktopSelection>,
     helper: PathBuf,
 }
 
 #[derive(Clone)]
 struct DesktopSelection {
+    backend: DesktopBackend,
+    capture_output: String,
+    id: String,
     output: String,
     mode: String,
     workspace: u32,
     virtual_output: bool,
+}
+
+#[derive(Clone)]
+enum DesktopBackend {
+    Unavailable,
+    Hyprland {
+        signature: String,
+        wayland_display: String,
+    },
+    Sway {
+        wayland_display: String,
+        sway_socket: String,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedOutput {
+    public: DesktopOutput,
+    backend: DesktopBackend,
+    capture_output: String,
+    present: bool,
 }
 
 #[derive(Deserialize)]
@@ -94,6 +120,7 @@ struct DesktopStatusResponse {
     available: bool,
     active: bool,
     viewer_connected: bool,
+    output_id: String,
     output: String,
     mode: String,
     workspace: u32,
@@ -105,6 +132,7 @@ struct DesktopStatusResponse {
 
 #[derive(Clone, Serialize)]
 struct DesktopOutput {
+    id: String,
     name: String,
     description: String,
     mode: String,
@@ -136,6 +164,33 @@ struct HyprWorkspace {
 }
 
 #[derive(Deserialize)]
+struct HyprInstance {
+    instance: String,
+    wl_socket: String,
+}
+
+#[derive(Deserialize)]
+struct SwayOutput {
+    name: String,
+    active: bool,
+    current_workspace: Option<String>,
+    current_mode: Option<SwayMode>,
+}
+
+#[derive(Deserialize)]
+struct SwayMode {
+    width: u32,
+    height: u32,
+    refresh: u32,
+}
+
+struct ForgeSession {
+    wayland_display: String,
+    sway_socket: String,
+    output: String,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
     Resize { cols: u16, rows: u16 },
@@ -164,7 +219,11 @@ async fn main() -> Result<()> {
             viewer_connected: AtomicBool::new(false),
             headless_output: config.desktop_output.clone(),
             headless_mode: config.desktop_mode.clone(),
+            forge_session_file: config.forge_session_file.clone(),
             selection: StdMutex::new(DesktopSelection {
+                backend: DesktopBackend::Unavailable,
+                capture_output: config.desktop_output.clone(),
+                id: config.desktop_output.clone(),
                 output: config.desktop_output.clone(),
                 mode: config.desktop_mode.clone(),
                 workspace: 0,
@@ -218,6 +277,7 @@ struct Config {
     desktop_output: String,
     desktop_mode: String,
     desktop_helper: PathBuf,
+    forge_session_file: PathBuf,
 }
 
 impl Config {
@@ -254,6 +314,14 @@ impl Config {
         let desktop_helper = env::var_os("EUTHERGATE_DESKTOP_HELPER")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("scripts/webrtc_desktop.py"));
+        let forge_session_file = env::var_os("EUTHERGATE_FORGE_SESSION_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix_uid())));
+                runtime_dir.join("euthergate-forge/session.env")
+            });
 
         Ok(Self {
             bind,
@@ -267,6 +335,7 @@ impl Config {
             desktop_output,
             desktop_mode,
             desktop_helper,
+            forge_session_file,
         })
     }
 }
@@ -509,6 +578,7 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         available: desktop.helper.is_file(),
         active: desktop.active.load(Ordering::Acquire),
         viewer_connected: desktop.viewer_connected.load(Ordering::Acquire),
+        output_id: selection.id,
         output: selection.output,
         mode: selection.mode,
         workspace: selection.workspace,
@@ -619,24 +689,12 @@ impl DesktopManager {
     }
 
     async fn outputs(&self) -> Result<Vec<DesktopOutput>> {
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        let mut outputs = parse_outputs(&monitors, &self.headless_output)?;
-        if !outputs
-            .iter()
-            .any(|output| output.name == self.headless_output)
-        {
-            outputs.insert(
-                0,
-                DesktopOutput {
-                    name: self.headless_output.clone(),
-                    description: "Virtual Forge output".into(),
-                    mode: self.headless_mode.clone(),
-                    workspace: 0,
-                    virtual_output: true,
-                },
-            );
-        }
-        Ok(outputs)
+        Ok(self
+            .resolved_outputs()
+            .await?
+            .into_iter()
+            .map(|output| output.public)
+            .collect())
     }
 
     async fn start(&self, requested_output: Option<&str>) -> Result<DesktopSelection> {
@@ -645,42 +703,63 @@ impl DesktopManager {
             anyhow::bail!("WebRTC helper not found at {}", self.helper.display());
         }
 
-        let requested = requested_output.unwrap_or(&self.headless_output);
+        let mut outputs = self.resolved_outputs().await?;
+        let fallback_id = outputs
+            .iter()
+            .find(|output| matches!(output.backend, DesktopBackend::Sway { .. }))
+            .or_else(|| outputs.first())
+            .map(|output| output.public.id.clone())
+            .unwrap_or_else(|| self.headless_output.clone());
+        let requested = requested_output.map(str::to_owned).unwrap_or(fallback_id);
         let previous = self.selection();
-        if self.viewer_connected.load(Ordering::Acquire) && requested != previous.output {
+        if self.viewer_connected.load(Ordering::Acquire) && requested != previous.id {
             anyhow::bail!("disconnect the current viewer before switching output");
         }
 
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        let existing = parse_outputs(&monitors, &self.headless_output)?;
-        if requested == self.headless_output {
-            if !existing.iter().any(|output| output.name == requested) {
-                hyprctl(&["output", "create", "headless", &self.headless_output]).await?;
-            }
-            if let Err(error) = hyprctl(&[
-                "keyword",
-                "monitor",
-                &format!("{},{},auto,1", self.headless_output, self.headless_mode),
-            ])
+        let mut selected = outputs
+            .iter()
+            .find(|output| output.public.id == requested || output.public.name == requested)
+            .cloned()
+            .with_context(|| format!("Wayland output {requested} does not exist"))?;
+
+        if !selected.present {
+            let DesktopBackend::Hyprland { signature, .. } = &selected.backend else {
+                anyhow::bail!("Wayland output {requested} is unavailable");
+            };
+            hyprctl_instance(
+                signature,
+                &["output", "create", "headless", &self.headless_output],
+            )
+            .await?;
+            if let Err(error) = hyprctl_instance(
+                signature,
+                &[
+                    "keyword",
+                    "monitor",
+                    &format!("{},{},auto,1", self.headless_output, self.headless_mode),
+                ],
+            )
             .await
             {
-                let _ = hyprctl(&["output", "remove", &self.headless_output]).await;
+                let _ =
+                    hyprctl_instance(signature, &["output", "remove", &self.headless_output]).await;
                 return Err(error);
             }
-        } else if !existing.iter().any(|output| output.name == requested) {
-            anyhow::bail!("Wayland output {requested} does not exist");
+            outputs = self.resolved_outputs().await?;
+            selected = outputs
+                .into_iter()
+                .find(|output| output.public.id == requested)
+                .with_context(|| format!("Wayland output {requested} disappeared"))?;
         }
 
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        let selected = parse_outputs(&monitors, &self.headless_output)?
-            .into_iter()
-            .find(|output| output.name == requested)
-            .with_context(|| format!("Wayland output {requested} disappeared"))?;
         let selection = DesktopSelection {
-            output: selected.name,
-            mode: selected.mode,
-            workspace: selected.workspace,
-            virtual_output: selected.virtual_output,
+            backend: selected.backend,
+            capture_output: selected.capture_output,
+            id: selected.public.id,
+            output: selected.public.name,
+            mode: selected.public.mode,
+            workspace: selected.public.workspace,
+            virtual_output: selected.public.virtual_output,
         };
         *self.selection.lock().expect("desktop selection poisoned") = selection.clone();
         self.active.store(true, Ordering::Release);
@@ -693,12 +772,17 @@ impl DesktopManager {
         if !self.active.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        if parse_outputs(&monitors, &self.headless_output)?
-            .iter()
-            .any(|output| output.name == self.headless_output)
+        let selection = self.selection();
+        if selection.capture_output == self.headless_output
+            && let DesktopBackend::Hyprland { signature, .. } = &selection.backend
         {
-            hyprctl(&["output", "remove", &self.headless_output]).await?;
+            let monitors = hyprctl_instance(signature, &["monitors", "all", "-j"]).await?;
+            if parse_outputs(&monitors, &self.headless_output)?
+                .iter()
+                .any(|output| output.name == self.headless_output)
+            {
+                hyprctl_instance(signature, &["output", "remove", &self.headless_output]).await?;
+            }
         }
         info!("desktop capture stopped");
         Ok(())
@@ -709,11 +793,118 @@ impl DesktopManager {
             anyhow::bail!("start a desktop capture first");
         }
         let selection = self.selection();
-        let monitors = hyprctl(&["monitors", "all", "-j"]).await?;
-        let workspace = monitor_workspace(&monitors, &selection.output)?;
-        let rule = format!("[workspace {workspace} silent] kitty --title EutherGate-Remote-Forge");
-        hyprctl(&["dispatch", "exec", &rule]).await?;
-        Ok(workspace)
+        match &selection.backend {
+            DesktopBackend::Hyprland { signature, .. } => {
+                let monitors = hyprctl_instance(signature, &["monitors", "all", "-j"]).await?;
+                let workspace = monitor_workspace(&monitors, &selection.capture_output)?;
+                let rule =
+                    format!("[workspace {workspace} silent] kitty --title EutherGate-Remote-Forge");
+                hyprctl_instance(signature, &["dispatch", "exec", &rule]).await?;
+                Ok(workspace)
+            }
+            DesktopBackend::Sway { sway_socket, .. } => {
+                swayctl(
+                    sway_socket,
+                    &["exec", "kitty --title EutherGate-Remote-Forge"],
+                )
+                .await?;
+                Ok(selection.workspace)
+            }
+            DesktopBackend::Unavailable => anyhow::bail!("no Wayland session is available"),
+        }
+    }
+
+    async fn resolved_outputs(&self) -> Result<Vec<ResolvedOutput>> {
+        let mut outputs = Vec::new();
+        if let Ok(session) = read_forge_session(&self.forge_session_file) {
+            let raw = swayctl(&session.sway_socket, &["-t", "get_outputs", "-r"]).await;
+            if let Ok(raw) = raw {
+                let sway_outputs: Vec<SwayOutput> =
+                    serde_json::from_str(&raw).context("swaymsg returned invalid output JSON")?;
+                for output in sway_outputs.into_iter().filter(|output| output.active) {
+                    if output.name != session.output {
+                        continue;
+                    }
+                    let Some(mode) = output.current_mode else {
+                        continue;
+                    };
+                    let workspace = output
+                        .current_workspace
+                        .as_deref()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(1);
+                    let name = output.name;
+                    outputs.push(ResolvedOutput {
+                        public: DesktopOutput {
+                            id: format!("forge:{name}"),
+                            name: "Forge Session".into(),
+                            description: "Always-on headless desktop".into(),
+                            mode: format!("{}x{}@{}", mode.width, mode.height, mode.refresh / 1000),
+                            workspace,
+                            virtual_output: true,
+                        },
+                        backend: DesktopBackend::Sway {
+                            wayland_display: session.wayland_display.clone(),
+                            sway_socket: session.sway_socket.clone(),
+                        },
+                        capture_output: name,
+                        present: true,
+                    });
+                }
+            }
+        }
+
+        let instances = hypr_instances().await.unwrap_or_default();
+        for instance in instances {
+            let raw = match hyprctl_instance(&instance.instance, &["monitors", "all", "-j"]).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    warn!(signature = %instance.instance, %error, "could not inspect Hyprland session");
+                    continue;
+                }
+            };
+            let parsed = parse_outputs(&raw, &self.headless_output)?;
+            let has_headless = parsed
+                .iter()
+                .any(|output| output.name == self.headless_output);
+            for mut output in parsed {
+                let capture_output = output.name.clone();
+                output.id = format!("hypr:{}:{}", instance.instance, output.name);
+                output.description = if output.virtual_output {
+                    "Logged-in Hyprland virtual output".into()
+                } else {
+                    format!("Logged-in Hyprland · {}", output.description)
+                };
+                outputs.push(ResolvedOutput {
+                    public: output,
+                    backend: DesktopBackend::Hyprland {
+                        signature: instance.instance.clone(),
+                        wayland_display: instance.wl_socket.clone(),
+                    },
+                    capture_output,
+                    present: true,
+                });
+            }
+            if !has_headless {
+                outputs.push(ResolvedOutput {
+                    public: DesktopOutput {
+                        id: format!("hypr:{}:{}", instance.instance, self.headless_output),
+                        name: "Logged-in Virtual Output".into(),
+                        description: "Create a private output in the logged-in session".into(),
+                        mode: self.headless_mode.clone(),
+                        workspace: 0,
+                        virtual_output: true,
+                    },
+                    backend: DesktopBackend::Hyprland {
+                        signature: instance.instance,
+                        wayland_display: instance.wl_socket,
+                    },
+                    capture_output: self.headless_output.clone(),
+                    present: false,
+                });
+            }
+        }
+        Ok(outputs)
     }
 }
 
@@ -723,6 +914,7 @@ fn parse_outputs(monitors: &str, headless_output: &str) -> Result<Vec<DesktopOut
     Ok(monitors
         .into_iter()
         .map(|monitor| DesktopOutput {
+            id: monitor.name.clone(),
             virtual_output: monitor.name == headless_output,
             mode: format!(
                 "{}x{}@{}",
@@ -757,8 +949,24 @@ fn monitor_workspace(monitors: &str, output: &str) -> Result<u32> {
         .with_context(|| format!("Hyprland output {output} has no active workspace"))
 }
 
-async fn hyprctl(args: &[&str]) -> Result<String> {
+async fn hypr_instances() -> Result<Vec<HyprInstance>> {
     let output = Command::new("hyprctl")
+        .args(["instances", "-j"])
+        .output()
+        .await
+        .context("could not enumerate Hyprland instances")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "hyprctl instances failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("hyprctl returned invalid instance JSON")
+}
+
+async fn hyprctl_instance(signature: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("hyprctl")
+        .args(["-i", signature])
         .args(args)
         .output()
         .await
@@ -773,15 +981,83 @@ async fn hyprctl(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+async fn swayctl(socket: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new("swaymsg")
+        .env("SWAYSOCK", socket)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("could not run swaymsg {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "swaymsg {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn read_forge_session(path: &Path) -> Result<ForgeSession> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let value = |name: &str| -> Result<String> {
+        contents
+            .lines()
+            .find_map(|line| line.split_once('=').filter(|(key, _)| *key == name))
+            .map(|(_, value)| value.to_owned())
+            .filter(|value| !value.is_empty() && !value.contains(char::is_whitespace))
+            .with_context(|| format!("{name} missing from {}", path.display()))
+    };
+    if value("BACKEND")? != "sway" {
+        anyhow::bail!("unsupported Forge compositor backend");
+    }
+    Ok(ForgeSession {
+        wayland_display: value("WAYLAND_DISPLAY")?,
+        sway_socket: value("SWAYSOCK")?,
+        output: value("OUTPUT")?,
+    })
+}
+
 async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
     let selection = desktop.selection();
-    let mut child = Command::new("python")
+    let (backend_name, wayland_display) = match &selection.backend {
+        DesktopBackend::Hyprland {
+            signature,
+            wayland_display,
+        } => (
+            "hyprland",
+            (
+                wayland_display,
+                Some(("HYPRLAND_INSTANCE_SIGNATURE", signature)),
+            ),
+        ),
+        DesktopBackend::Sway {
+            wayland_display,
+            sway_socket,
+        } => ("sway", (wayland_display, Some(("SWAYSOCK", sway_socket)))),
+        DesktopBackend::Unavailable => anyhow::bail!("selected Wayland session is unavailable"),
+    };
+    let mut command = Command::new("python");
+    command
         .arg(&desktop.helper)
-        .args(["--output", &selection.output, "--mode", &selection.mode])
+        .args([
+            "--backend",
+            backend_name,
+            "--output",
+            &selection.capture_output,
+            "--mode",
+            &selection.mode,
+        ])
+        .env("WAYLAND_DISPLAY", wayland_display.0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    if let Some((name, value)) = wayland_display.1 {
+        command.env(name, value);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("could not start {}", desktop.helper.display()))?;
     let mut child_input = child
@@ -907,6 +1183,12 @@ fn env_bool(name: &str, default: bool) -> Result<bool> {
     }
 }
 
+fn nix_uid() -> u32 {
+    std::fs::metadata("/proc/self")
+        .map(|metadata| metadata.uid())
+        .unwrap_or(1000)
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("euthergate=info,tower_http=info"));
@@ -997,5 +1279,27 @@ mod tests {
         assert!(!outputs[0].virtual_output);
         assert_eq!(outputs[1].description, "Virtual output");
         assert!(outputs[1].virtual_output);
+    }
+
+    #[test]
+    fn forge_session_file_is_parsed_without_shell_evaluation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.env");
+        std::fs::write(
+            &path,
+            "BACKEND=sway\nWAYLAND_DISPLAY=wayland-2\nSWAYSOCK=/run/user/1000/sway.sock\nOUTPUT=HEADLESS-1\n",
+        )
+        .unwrap();
+        let session = read_forge_session(&path).unwrap();
+        assert_eq!(session.wayland_display, "wayland-2");
+        assert_eq!(session.sway_socket, "/run/user/1000/sway.sock");
+        assert_eq!(session.output, "HEADLESS-1");
+
+        std::fs::write(
+            &path,
+            "BACKEND=sway\nWAYLAND_DISPLAY=$(touch /tmp/nope)\nSWAYSOCK=x\nOUTPUT=y\n",
+        )
+        .unwrap();
+        assert!(read_forge_session(&path).is_err());
     }
 }

@@ -1,0 +1,13 @@
+[Unit]
+Description=EutherGate persistent headless Forge desktop
+After=basic.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/EutherGate
+ExecStart=%h/EutherGate/scripts/run-forge-session.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,7 +1,7 @@
 [Unit]
 Description=EutherGate remote development gateway
-After=graphical-session.target
-PartOf=graphical-session.target
+After=euthergate-forge.service
+Wants=euthergate-forge.service
 
 [Service]
 Type=simple
@@ -11,4 +11,4 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
