@@ -46,6 +46,7 @@ const PROXY_AUTH_HEADER: &str = "x-euthergate-proxy-token";
 const HISTORY_LIMIT: usize = 256 * 1024;
 const CLIPBOARD_LIMIT: usize = 8 * 1024 * 1024;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
+const DISPLAY_WAKE_HOLD_SECONDS: u64 = 120;
 
 #[derive(Clone)]
 struct AppState {
@@ -149,6 +150,13 @@ struct DesktopStartQuery {
     output: Option<String>,
 }
 
+#[derive(Serialize)]
+struct DisplayWakeResponse {
+    woken: Vec<String>,
+    locked: bool,
+    hold_seconds: u64,
+}
+
 #[derive(Deserialize)]
 struct HyprMonitor {
     name: String,
@@ -249,6 +257,7 @@ async fn main() -> Result<()> {
         .route("/api/status", get(status))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
+        .route("/api/displays/wake", post(display_wake))
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -572,6 +581,24 @@ async fn terminal_socket(socket: WebSocket, terminal: Arc<TerminalSession>) {
                     break;
                 }
             }
+        }
+    }
+}
+
+async fn display_wake(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    match wake_physical_displays(&state.desktop.headless_output).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => {
+            warn!(%error, "could not wake physical displays");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
         }
     }
 }
@@ -1163,6 +1190,91 @@ async fn hyprctl_instance(signature: &str, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+async fn wake_physical_displays(headless_output: &str) -> Result<DisplayWakeResponse> {
+    let instances = hypr_instances().await?;
+    if instances.is_empty() {
+        anyhow::bail!("no logged-in Hyprland session is available");
+    }
+
+    let hold_seconds = start_idle_hold().await;
+    let mut woken = Vec::new();
+    let mut errors = Vec::new();
+    for instance in instances {
+        let monitors = match hyprctl_instance(&instance.instance, &["monitors", "all", "-j"]).await
+        {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        let outputs = match parse_outputs(&monitors, headless_output) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                errors.push(error.to_string());
+                continue;
+            }
+        };
+        for output in outputs.into_iter().filter(|output| !output.virtual_output) {
+            match hyprctl_instance(
+                &instance.instance,
+                &["dispatch", "dpms", "on", &output.name],
+            )
+            .await
+            {
+                Ok(_) => woken.push(output.name),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+    }
+
+    if woken.is_empty() {
+        let detail = errors
+            .first()
+            .map(String::as_str)
+            .unwrap_or("no physical outputs found");
+        anyhow::bail!("no physical Hyprland display could be woken: {detail}");
+    }
+
+    woken.sort();
+    woken.dedup();
+    let locked = Command::new("pidof")
+        .arg("hyprlock")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success());
+    info!(outputs = ?woken, locked, hold_seconds, "physical displays woken remotely");
+    Ok(DisplayWakeResponse {
+        woken,
+        locked,
+        hold_seconds,
+    })
+}
+
+async fn start_idle_hold() -> u64 {
+    let child = Command::new("systemd-inhibit")
+        .args([
+            "--what=idle",
+            "--mode=block",
+            "--why=EutherGate remote screen wake",
+            "sleep",
+            &DISPLAY_WAKE_HOLD_SECONDS.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(_) => DISPLAY_WAKE_HOLD_SECONDS,
+        Err(error) => {
+            warn!(%error, "could not start temporary idle inhibitor; displays were still woken");
+            0
+        }
+    }
 }
 
 async fn swayctl(socket: &str, args: &[&str]) -> Result<String> {

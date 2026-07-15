@@ -14,6 +14,7 @@ The first two checkpoints form a usable vertical slice:
 - VP8 desktop video transported with WebRTC;
 - pointer, keyboard and wheel events over a WebRTC DataChannel;
 - text and image clipboard transfer between the selected Wayland session and browser;
+- authenticated physical display wake-up with a short idle grace period;
 - a browser switcher between Gate Shell and Remote Forge.
 
 ## Run it
@@ -72,6 +73,11 @@ and press Ctrl+V. Payloads are authenticated, never logged and limited to 8 MiB.
 
 The workspace number is shown in the lower-left WebRTC HUD and may differ from
 `3` depending on the current compositor state.
+
+Use **WAKE SCREENS** to turn on the physical outputs of the logged-in Hyprland
+session. EutherGate asks Hypridle to stay idle-inhibited for two minutes so a
+locked screen does not immediately switch off again. Hyprlock remains locked;
+the action never enters a password or unlocks the session.
 
 Click the streamed desktop to enter remote control. The browser locks the
 pointer for relative movement; press **Esc** to leave remote control and return

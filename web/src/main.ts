@@ -32,6 +32,12 @@ type DesktopOutput = {
   virtual_output: boolean;
 };
 
+type DisplayWakeResult = {
+  woken: string[];
+  locked: boolean;
+  hold_seconds: number;
+};
+
 const appNode = document.querySelector<HTMLDivElement>("#app");
 if (!appNode) throw new Error("Missing #app");
 const app: HTMLDivElement = appNode;
@@ -111,6 +117,7 @@ function renderTerminal(): void {
         </div>
         <div class="actions">
           <span id="socket-state" class="socket-state">CONNECTING</span>
+          <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <button id="show-desktop" class="ghost-button primary-action" type="button">DESKTOP</button>
           ${proxiedSession ? "" : '<button id="logout" class="ghost-button" type="button">CLOSE GATE</button>'}
         </div>
@@ -153,6 +160,7 @@ function renderTerminal(): void {
   terminal.onResize(sendResize);
   window.addEventListener("resize", fitTerminal);
   document.querySelector<HTMLButtonElement>("#logout")?.addEventListener("click", logout);
+  document.querySelector<HTMLButtonElement>(".wake-screens")?.addEventListener("click", wakeScreens);
   document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
   connectSocket();
 }
@@ -168,6 +176,7 @@ async function renderDesktop(): Promise<void> {
         </div>
         <div class="actions">
           <span id="desktop-state" class="socket-state">PROBING</span>
+          <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <select id="desktop-output-picker" class="output-picker" aria-label="Wayland output" disabled></select>
           <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
           <button id="desktop-clipboard" class="ghost-button" type="button" disabled>CLIPBOARD</button>
@@ -213,6 +222,7 @@ async function renderDesktop(): Promise<void> {
     </section>`);
 
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
+  document.querySelector<HTMLButtonElement>(".wake-screens")?.addEventListener("click", wakeScreens);
   document.querySelector<HTMLButtonElement>("#desktop-power")?.addEventListener("click", toggleDesktop);
   document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
@@ -743,6 +753,34 @@ function setDesktopState(value: string): void {
   if (state) state.textContent = value;
   const label = document.querySelector<HTMLElement>("#connection-label");
   if (label) label.textContent = value === "LIVE" ? "DESKTOP LIVE" : value;
+}
+
+async function wakeScreens(event: Event): Promise<void> {
+  const button = event.currentTarget as HTMLButtonElement;
+  const original = "WAKE SCREENS";
+  button.disabled = true;
+  button.classList.remove("success");
+  button.textContent = "WAKING…";
+  try {
+    const response = await fetch(gateUrl("api/displays/wake"), { method: "POST" });
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    const body = (await response.json()) as DisplayWakeResult & { error?: string };
+    if (!response.ok) throw new Error(body.error || "The displays did not wake.");
+    const lockState = body.locked ? "LOCKED" : "UNLOCKED";
+    button.textContent = `AWAKE · ${lockState}`;
+    button.title = `${body.woken.join(", ")} awake${body.hold_seconds ? ` for ${body.hold_seconds} seconds` : ""}`;
+    button.classList.add("success");
+  } catch (error) {
+    button.textContent = "WAKE FAILED";
+    button.title = error instanceof Error ? error.message : "The displays did not wake.";
+  } finally {
+    window.setTimeout(() => {
+      if (!button.isConnected) return;
+      button.disabled = false;
+      button.classList.remove("success");
+      button.textContent = original;
+    }, 3500);
+  }
 }
 
 function showDesktopMessage(message: string): void {
