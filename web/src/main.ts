@@ -6,6 +6,7 @@ import "./style.css";
 type Status = {
   authenticated: boolean;
   terminal_ready: boolean;
+  auth_mode: "none" | "gate_cookie" | "eutheroxide_proxy";
 };
 
 type DesktopStatus = {
@@ -44,12 +45,25 @@ let remoteCandidates: RTCIceCandidateInit[] = [];
 let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
 let desktopControlActive = false;
+let proxiedSession = false;
+
+const gateRoot = new URL("./", document.baseURI);
+
+function gateUrl(path: string): URL {
+  return new URL(path.replace(/^\//, ""), gateRoot);
+}
+
+function gateWebSocket(path: string): URL {
+  const url = gateUrl(path);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
 
 function gateShell(content: string): string {
   return `
     <main class="gate-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="EutherGate home">
+        <a class="brand" href="${escapeHtml(gateRoot.pathname)}" aria-label="EutherGate home">
           <span class="brand-mark" aria-hidden="true"><i></i></span>
           <span><strong>Euther</strong>Gate</span>
         </a>
@@ -92,7 +106,7 @@ function renderTerminal(): void {
         <div class="actions">
           <span id="socket-state" class="socket-state">CONNECTING</span>
           <button id="show-desktop" class="ghost-button primary-action" type="button">DESKTOP</button>
-          <button id="logout" class="ghost-button" type="button">CLOSE GATE</button>
+          ${proxiedSession ? "" : '<button id="logout" class="ghost-button" type="button">CLOSE GATE</button>'}
         </div>
       </div>
       <div class="terminal-frame">
@@ -179,7 +193,7 @@ async function renderDesktop(): Promise<void> {
   installDesktopInput();
 
   try {
-    const response = await fetch("/api/desktop/status");
+    const response = await fetch(gateUrl("api/desktop/status"));
     if (response.status === 401) return renderLogin("Your gate session expired.");
     if (!response.ok) throw new Error("Desktop service did not answer.");
     const status = (await response.json()) as DesktopStatus;
@@ -227,8 +241,8 @@ async function toggleDesktop(): Promise<void> {
   setDesktopState(active ? "STOPPING" : "STARTING");
   try {
     const selectedOutput = document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.value;
-    const startUrl = selectedOutput ? `/api/desktop/start?output=${encodeURIComponent(selectedOutput)}` : "/api/desktop/start";
-    const response = await fetch(active ? "/api/desktop/stop" : startUrl, { method: "POST" });
+    const startUrl = selectedOutput ? `api/desktop/start?output=${encodeURIComponent(selectedOutput)}` : "api/desktop/start";
+    const response = await fetch(gateUrl(active ? "api/desktop/stop" : startUrl), { method: "POST" });
     const body = (await response.json()) as { active?: boolean; error?: string };
     if (!response.ok) throw new Error(body.error || "Desktop transition failed.");
     button.dataset.active = String(!active);
@@ -259,10 +273,10 @@ async function switchDesktopOutput(): Promise<void> {
   disposeDesktop();
   await new Promise((resolve) => window.setTimeout(resolve, 250));
   try {
-    const response = await fetch(`/api/desktop/start?output=${encodeURIComponent(picker.value)}`, { method: "POST" });
+    const response = await fetch(gateUrl(`api/desktop/start?output=${encodeURIComponent(picker.value)}`), { method: "POST" });
     const body = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(body.error || "Output switch failed.");
-    const statusResponse = await fetch("/api/desktop/status");
+    const statusResponse = await fetch(gateUrl("api/desktop/status"));
     const status = (await statusResponse.json()) as DesktopStatus;
     updateDesktopStatus(status);
     connectDesktop();
@@ -278,7 +292,7 @@ async function launchDesktopTerminal(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#desktop-terminal");
   if (button) button.disabled = true;
   try {
-    const response = await fetch("/api/desktop/launch-terminal", { method: "POST" });
+    const response = await fetch(gateUrl("api/desktop/launch-terminal"), { method: "POST" });
     const body = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(body.error || "Could not launch terminal.");
   } catch (error) {
@@ -291,8 +305,7 @@ async function launchDesktopTerminal(): Promise<void> {
 
 function connectDesktop(): void {
   disposeDesktop();
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(`${protocol}//${location.host}/ws/desktop`);
+  socket = new WebSocket(gateWebSocket("ws/desktop"));
   remoteCandidates = [];
   desktopVideoReady = false;
   setDesktopState("NEGOTIATING");
@@ -522,7 +535,7 @@ async function login(event: SubmitEvent): Promise<void> {
   if (message) message.textContent = "Opening secure session…";
 
   try {
-    const response = await fetch("/api/login", {
+    const response = await fetch(gateUrl("api/login"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: input.value }),
@@ -538,14 +551,13 @@ async function login(event: SubmitEvent): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  await fetch("/api/logout", { method: "POST" });
+  await fetch(gateUrl("api/logout"), { method: "POST" });
   renderLogin("Gate closed.");
 }
 
 function connectSocket(): void {
   if (!terminal || !fitAddon) return;
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(`${protocol}//${location.host}/ws/terminal`);
+  socket = new WebSocket(gateWebSocket("ws/terminal"));
   socket.binaryType = "arraybuffer";
   setSocketState("CONNECTING");
 
@@ -630,8 +642,9 @@ function escapeHtml(value: string): string {
 
 async function boot(): Promise<void> {
   try {
-    const response = await fetch("/api/status");
+    const response = await fetch(gateUrl("api/status"));
     const status = (await response.json()) as Status;
+    proxiedSession = status.auth_mode === "eutheroxide_proxy";
     status.authenticated ? renderTerminal() : renderLogin();
   } catch {
     renderLogin("The local gateway is not responding.");

@@ -95,6 +95,22 @@ npm --prefix web run dev
 
 Vite proxies `/api` and `/ws` to the gateway.
 
+## Autostart and EutherOxide tunnel
+
+Install the release gateway and its persistent reverse tunnel as user services:
+
+```bash
+./scripts/install-user-services.sh
+```
+
+This generates a private `EUTHERGATE_PROXY_TOKEN` when needed, builds the web
+UI and release binary, and enables `euthergate.service` plus
+`euthergate-tunnel.service`. The tunnel exposes the gateway only as
+`127.0.0.1:18787` on the EutherOxide host; it does not bind a public server
+port. EutherOxide must authenticate an admin request, strip the `/euthergate`
+prefix, and add the configured token as `X-EutherGate-Proxy-Token` to HTTP and
+WebSocket upstream requests.
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -108,6 +124,7 @@ Vite proxies `/api` and `/ws` to the gateway.
 | `EUTHERGATE_DESKTOP_MODE` | `1280x720@30` | Virtual output resolution and frame rate. |
 | `EUTHERGATE_DESKTOP_HELPER` | `scripts/webrtc_desktop.py` | GStreamer media helper. |
 | `EUTHERGATE_SECURE_COOKIE` | `false` | Add `Secure` to the auth cookie. Enable behind HTTPS. |
+| `EUTHERGATE_PROXY_TOKEN` | unset | Shared secret accepted only from the EutherOxide admin proxy. |
 | `RUST_LOG` | `euthergate=info,tower_http=info` | Log filter. |
 
 Never expose this checkpoint directly to the public internet. Put it behind TLS

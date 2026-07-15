@@ -39,6 +39,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const AUTH_COOKIE: &str = "euthergate_session";
+const PROXY_AUTH_HEADER: &str = "x-euthergate-proxy-token";
 const HISTORY_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone)]
@@ -46,6 +47,7 @@ struct AppState {
     token_hash: [u8; 32],
     auth_session: Arc<str>,
     secure_cookie: bool,
+    proxy_token_hash: Option<[u8; 32]>,
     terminal: Arc<TerminalSession>,
     desktop: Arc<DesktopManager>,
 }
@@ -84,6 +86,7 @@ struct LoginRequest {
 struct StatusResponse {
     authenticated: bool,
     terminal_ready: bool,
+    auth_mode: &'static str,
 }
 
 #[derive(Serialize)]
@@ -153,6 +156,7 @@ async fn main() -> Result<()> {
         token_hash: hash_token(&config.token),
         auth_session: Arc::from(random_secret(32)),
         secure_cookie: config.secure_cookie,
+        proxy_token_hash: config.proxy_token.as_deref().map(hash_token),
         terminal,
         desktop: Arc::new(DesktopManager {
             transition: Mutex::new(()),
@@ -207,6 +211,7 @@ struct Config {
     token: String,
     generated_token: Option<String>,
     secure_cookie: bool,
+    proxy_token: Option<String>,
     shell: PathBuf,
     workdir: PathBuf,
     web_root: PathBuf,
@@ -229,6 +234,9 @@ impl Config {
             .parse()
             .context("EUTHERGATE_BIND must be an IP address and port")?;
         let secure_cookie = env_bool("EUTHERGATE_SECURE_COOKIE", false)?;
+        let proxy_token = env::var("EUTHERGATE_PROXY_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
         let shell = env::var_os("EUTHERGATE_SHELL")
             .or_else(|| env::var_os("SHELL"))
             .map(PathBuf::from)
@@ -252,6 +260,7 @@ impl Config {
             token,
             generated_token,
             secure_cookie,
+            proxy_token,
             shell,
             workdir,
             web_root,
@@ -384,9 +393,11 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {
+    let auth_mode = authentication_mode(&headers, &state);
     Json(StatusResponse {
-        authenticated: is_authenticated(&headers, &state),
+        authenticated: auth_mode != "none",
         terminal_ready: true,
+        auth_mode,
     })
 }
 
@@ -825,6 +836,31 @@ async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Resu
 }
 
 fn is_authenticated(headers: &HeaderMap, state: &AppState) -> bool {
+    authentication_mode(headers, state) != "none"
+}
+
+fn authentication_mode(headers: &HeaderMap, state: &AppState) -> &'static str {
+    if proxy_token_authenticated(headers, state.proxy_token_hash.as_ref()) {
+        return "eutheroxide_proxy";
+    }
+
+    if cookie_authenticated(headers, state) {
+        "gate_cookie"
+    } else {
+        "none"
+    }
+}
+
+fn proxy_token_authenticated(headers: &HeaderMap, expected: Option<&[u8; 32]>) -> bool {
+    expected.is_some_and(|expected| {
+        headers
+            .get(PROXY_AUTH_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| constant_time_eq(&hash_token(value), expected))
+    })
+}
+
+fn cookie_authenticated(headers: &HeaderMap, state: &AppState) -> bool {
     headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -910,6 +946,17 @@ mod tests {
     fn token_hash_is_stable_and_not_plaintext() {
         assert_eq!(hash_token("gate"), hash_token("gate"));
         assert_ne!(hash_token("gate"), hash_token("other"));
+    }
+
+    #[test]
+    fn trusted_proxy_token_must_be_configured_and_match() {
+        let expected = hash_token("oxide-secret");
+        let mut headers = HeaderMap::new();
+        headers.insert(PROXY_AUTH_HEADER, HeaderValue::from_static("wrong"));
+        assert!(!proxy_token_authenticated(&headers, Some(&expected)));
+        headers.insert(PROXY_AUTH_HEADER, HeaderValue::from_static("oxide-secret"));
+        assert!(proxy_token_authenticated(&headers, Some(&expected)));
+        assert!(!proxy_token_authenticated(&headers, None));
     }
 
     #[test]

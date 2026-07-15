@@ -1,0 +1,14 @@
+[Unit]
+Description=EutherGate remote development gateway
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/EutherGate
+ExecStart=%h/EutherGate/scripts/run-service.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
