@@ -21,6 +21,7 @@ type DesktopStatus = {
   input: string;
   virtual_output: boolean;
   outputs: DesktopOutput[];
+  ice_servers: RTCIceServer[];
 };
 
 type DesktopOutput = {
@@ -50,6 +51,7 @@ let fitAddon: FitAddon | null = null;
 let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
+let desktopIceServers: RTCIceServer[] = [];
 let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
 let desktopControlActive = false;
@@ -244,6 +246,7 @@ async function renderDesktop(): Promise<void> {
 }
 
 function updateDesktopStatus(status: DesktopStatus): void {
+  desktopIceServers = status.ice_servers || [];
   const power = document.querySelector<HTMLButtonElement>("#desktop-power");
   if (power) {
     power.disabled = !status.available;
@@ -553,7 +556,7 @@ function connectDesktop(): void {
   desktopVideoReady = false;
   setDesktopState("NEGOTIATING");
 
-  peer = new RTCPeerConnection({ bundlePolicy: "max-bundle" });
+  peer = new RTCPeerConnection({ bundlePolicy: "max-bundle", iceServers: desktopIceServers });
   peer.addTransceiver("video", { direction: "recvonly" });
   // Position must arrive before its click, and modifiers before their key.
   // SCTP's reliable ordered mode is still independent of the video stream.
@@ -581,6 +584,10 @@ function connectDesktop(): void {
     }
     if (["failed", "disconnected", "closed"].includes(peer?.connectionState || "")) setDesktopState("RECONNECTING");
   });
+  peer.addEventListener("iceconnectionstatechange", () => {
+    if (!peer || desktopVideoReady) return;
+    setDesktopState(`ICE ${peer.iceConnectionState.toUpperCase()}`);
+  });
 
   socket.addEventListener("open", async () => {
     if (!peer || socket?.readyState !== WebSocket.OPEN) return;
@@ -589,8 +596,10 @@ function connectDesktop(): void {
     socket.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
     desktopNegotiationTimer = window.setTimeout(() => {
       if (!desktopVideoReady) {
+        const rtcState = peer?.connectionState || "unknown";
+        const iceState = peer?.iceConnectionState || "unknown";
         setDesktopState("NO VIDEO");
-        showDesktopMessage("WebRTC connected without a video track. Reload and try again.");
+        showDesktopMessage(`No video frames yet (WebRTC ${rtcState}, ICE ${iceState}).`);
       }
     }, 8000);
   });

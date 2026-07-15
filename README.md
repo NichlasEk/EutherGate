@@ -148,12 +148,14 @@ WebSocket upstream requests.
 | `EUTHERGATE_FORGE_SESSION_FILE` | `$XDG_RUNTIME_DIR/euthergate-forge/session.env` | Runtime descriptor for the persistent Forge compositor. |
 | `EUTHERGATE_SECURE_COOKIE` | `false` | Add `Secure` to the auth cookie. Enable behind HTTPS. |
 | `EUTHERGATE_PROXY_TOKEN` | unset | Shared secret accepted only from the EutherOxide admin proxy. |
+| `EUTHERGATE_TURN_URLS` | unset | Comma-separated TURN/TURNS relay URLs for restrictive remote networks. |
+| `EUTHERGATE_TURN_SHARED_SECRET` | unset | Coturn REST shared secret used to mint one-hour client credentials. |
 | `RUST_LOG` | `euthergate=info,tower_http=info` | Log filter. |
 
 Never expose this checkpoint directly to the public internet. Put it behind TLS
 and a trusted access layer. A VPN such as Tailscale is currently the simplest
-remote path because ICE only advertises host candidates; internet traversal
-still needs configurable STUN/TURN. The next security slice will also add
+remote path when TURN is unavailable. Configure the TURN settings above for
+internet traversal through restrictive networks. The next security slice will also add
 durable users, session isolation and explicit reverse-proxy trust.
 
 Remote Forge currently captures through one `grim` process per frame. Input is

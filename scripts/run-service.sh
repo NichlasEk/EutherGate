@@ -7,6 +7,12 @@ cd "$ROOT_DIR"
 set -a
 # shellcheck disable=SC1091
 source .env
+# TURN credentials are kept separate so the normal gate configuration can be
+# copied or inspected without exposing the coturn shared secret.
+if [[ -r .env.turn ]]; then
+    # shellcheck disable=SC1091
+    source .env.turn
+fi
 set +a
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"

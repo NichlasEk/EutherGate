@@ -8,6 +8,7 @@ use std::{
     process::Stdio,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex as StdMutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -22,11 +23,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -47,6 +53,7 @@ const HISTORY_LIMIT: usize = 256 * 1024;
 const CLIPBOARD_LIMIT: usize = 8 * 1024 * 1024;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
 const DISPLAY_WAKE_HOLD_SECONDS: u64 = 120;
+const TURN_CREDENTIAL_TTL_SECONDS: u64 = 60 * 60;
 
 #[derive(Clone)]
 struct AppState {
@@ -54,6 +61,7 @@ struct AppState {
     auth_session: Arc<str>,
     secure_cookie: bool,
     proxy_token_hash: Option<[u8; 32]>,
+    turn: Option<Arc<TurnConfig>>,
     terminal: Arc<TerminalSession>,
     desktop: Arc<DesktopManager>,
 }
@@ -133,6 +141,21 @@ struct DesktopStatusResponse {
     input: &'static str,
     virtual_output: bool,
     outputs: Vec<DesktopOutput>,
+    ice_servers: Vec<IceServer>,
+}
+
+#[derive(Clone)]
+struct TurnConfig {
+    urls: Vec<String>,
+    shared_secret: Arc<str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IceServer {
+    urls: Vec<String>,
+    username: String,
+    credential: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -236,6 +259,7 @@ async fn main() -> Result<()> {
         auth_session: Arc::from(random_secret(32)),
         secure_cookie: config.secure_cookie,
         proxy_token_hash: config.proxy_token.as_deref().map(hash_token),
+        turn: config.turn.clone().map(Arc::new),
         terminal,
         desktop: Arc::new(DesktopManager {
             transition: Mutex::new(()),
@@ -303,6 +327,7 @@ struct Config {
     generated_token: Option<String>,
     secure_cookie: bool,
     proxy_token: Option<String>,
+    turn: Option<TurnConfig>,
     shell: PathBuf,
     workdir: PathBuf,
     web_root: PathBuf,
@@ -329,6 +354,38 @@ impl Config {
         let proxy_token = env::var("EUTHERGATE_PROXY_TOKEN")
             .ok()
             .filter(|value| !value.is_empty());
+        let turn_urls = env::var("EUTHERGATE_TURN_URLS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|urls| !urls.is_empty());
+        let turn_shared_secret = env::var("EUTHERGATE_TURN_SHARED_SECRET")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let turn = match (turn_urls, turn_shared_secret) {
+            (Some(urls), Some(shared_secret)) => {
+                if urls
+                    .iter()
+                    .any(|url| !url.starts_with("turn:") && !url.starts_with("turns:"))
+                {
+                    anyhow::bail!("EUTHERGATE_TURN_URLS entries must use turn: or turns:");
+                }
+                Some(TurnConfig {
+                    urls,
+                    shared_secret: Arc::from(shared_secret),
+                })
+            }
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "EUTHERGATE_TURN_URLS and EUTHERGATE_TURN_SHARED_SECRET must be set together"
+            ),
+        };
         let shell = env::var_os("EUTHERGATE_SHELL")
             .or_else(|| env::var_os("SHELL"))
             .map(PathBuf::from)
@@ -361,6 +418,7 @@ impl Config {
             generated_token,
             secure_cookie,
             proxy_token,
+            turn,
             shell,
             workdir,
             web_root,
@@ -701,6 +759,12 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     };
     let selection = desktop.selection();
+    let ice_servers = state
+        .turn
+        .as_deref()
+        .and_then(TurnConfig::ice_server)
+        .into_iter()
+        .collect();
     Json(DesktopStatusResponse {
         available: desktop.helper.is_file(),
         active: desktop.active.load(Ordering::Acquire),
@@ -713,6 +777,7 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         input: "WebRTC DataChannel",
         virtual_output: selection.virtual_output,
         outputs,
+        ice_servers,
     })
     .into_response()
 }
@@ -1621,6 +1686,25 @@ fn random_secret(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(random)
 }
 
+impl TurnConfig {
+    fn ice_server(&self) -> Option<IceServer> {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs()
+            .checked_add(TURN_CREDENTIAL_TTL_SECONDS)?;
+        let username = format!("{expires}:euthergate");
+        let mut mac = Hmac::<Sha1>::new_from_slice(self.shared_secret.as_bytes()).ok()?;
+        mac.update(username.as_bytes());
+        let credential = STANDARD.encode(mac.finalize().into_bytes());
+        Some(IceServer {
+            urls: self.urls.clone(),
+            username,
+            credential,
+        })
+    }
+}
+
 fn env_bool(name: &str, default: bool) -> Result<bool> {
     match env::var(name) {
         Ok(value) if matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
@@ -1680,6 +1764,19 @@ mod tests {
     fn token_hash_is_stable_and_not_plaintext() {
         assert_eq!(hash_token("gate"), hash_token("gate"));
         assert_ne!(hash_token("gate"), hash_token("other"));
+    }
+
+    #[test]
+    fn turn_credentials_are_ephemeral_and_hmac_authenticated() {
+        let turn = TurnConfig {
+            urls: vec!["turns:turn.example.test:443?transport=tcp".into()],
+            shared_secret: Arc::from("shared-secret"),
+        };
+        let server = turn.ice_server().unwrap();
+        assert_eq!(server.urls, turn.urls);
+        assert!(server.username.ends_with(":euthergate"));
+        assert!(!server.credential.is_empty());
+        assert!(!server.credential.contains("shared-secret"));
     }
 
     #[test]
