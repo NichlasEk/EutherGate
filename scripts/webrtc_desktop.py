@@ -362,10 +362,11 @@ class InputController:
                 modifiers.append("SHIFT")
             if event.get("meta"):
                 modifiers.append("SUPER")
-            if self.backend == "hyprland":
-                run_hyprctl("dispatch", "sendshortcut", f"{' '.join(modifiers)},{key}")
-            else:
-                run_wtype(key, modifiers)
+            # A Hyprland lock screen is a layer surface, not an ordinary active
+            # window, so `hyprctl dispatch sendshortcut` never reaches Hyprlock.
+            # wtype injects through Wayland's virtual-keyboard protocol and works
+            # for both regular clients and the compositor lock surface.
+            run_wtype(key, modifiers)
 
     def update_pointer(self, event: dict) -> None:
         if event.get("type") == "pointer_move":

@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     net::SocketAddr,
     os::unix::fs::MetadataExt,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicBool, Ordering},
@@ -36,6 +37,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
     process::Command,
     sync::{Mutex, broadcast},
     time::{Duration, timeout},
@@ -52,8 +54,11 @@ const PROXY_AUTH_HEADER: &str = "x-euthergate-proxy-token";
 const HISTORY_LIMIT: usize = 256 * 1024;
 const CLIPBOARD_LIMIT: usize = 8 * 1024 * 1024;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
+const TERMINAL_IMAGE_LIMIT: usize = 8 * 1024 * 1024;
 const DISPLAY_WAKE_HOLD_SECONDS: u64 = 120;
 const TURN_CREDENTIAL_TTL_SECONDS: u64 = 60 * 60;
+const FALLBACK_PACKET_HEADER_BYTES: usize = 5;
+const FALLBACK_MAX_PACKET_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -63,6 +68,7 @@ struct AppState {
     proxy_token_hash: Option<[u8; 32]>,
     turn: Option<Arc<TurnConfig>>,
     terminal: Arc<TerminalSession>,
+    terminal_upload_dir: Arc<PathBuf>,
     desktop: Arc<DesktopManager>,
 }
 
@@ -82,6 +88,8 @@ struct DesktopManager {
     forge_session_file: PathBuf,
     selection: StdMutex<DesktopSelection>,
     helper: PathBuf,
+    fallback_helper: PathBuf,
+    wayvnc: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -142,6 +150,7 @@ struct DesktopStatusResponse {
     virtual_output: bool,
     outputs: Vec<DesktopOutput>,
     ice_servers: Vec<IceServer>,
+    transport_profiles: Vec<TransportProfile>,
 }
 
 #[derive(Clone)]
@@ -156,6 +165,15 @@ struct IceServer {
     urls: Vec<String>,
     username: String,
     credential: String,
+}
+
+#[derive(Serialize)]
+struct TransportProfile {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    ice_transport_policy: &'static str,
+    urls: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -237,6 +255,13 @@ struct ClipboardPayload {
     data: Vec<u8>,
 }
 
+#[derive(Serialize)]
+struct TerminalImageUploadResponse {
+    path: String,
+    mime: &'static str,
+    size: usize,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
@@ -261,6 +286,7 @@ async fn main() -> Result<()> {
         proxy_token_hash: config.proxy_token.as_deref().map(hash_token),
         turn: config.turn.clone().map(Arc::new),
         terminal,
+        terminal_upload_dir: Arc::new(config.terminal_upload_dir.clone()),
         desktop: Arc::new(DesktopManager {
             transition: Mutex::new(()),
             active: AtomicBool::new(false),
@@ -278,6 +304,8 @@ async fn main() -> Result<()> {
                 virtual_output: true,
             }),
             helper: config.desktop_helper.clone(),
+            fallback_helper: config.desktop_fallback_helper.clone(),
+            wayvnc: config.wayvnc.clone(),
         }),
     };
 
@@ -290,6 +318,10 @@ async fn main() -> Result<()> {
         .route("/api/logout", post(logout))
         .route("/api/displays/wake", post(display_wake))
         .route("/api/services/{service}/restart", post(service_restart))
+        .route(
+            "/api/terminal/image",
+            post(terminal_image_upload).layer(DefaultBodyLimit::max(TERMINAL_IMAGE_LIMIT)),
+        )
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -305,6 +337,8 @@ async fn main() -> Result<()> {
         )
         .route("/ws/terminal", get(terminal_ws))
         .route("/ws/desktop", get(desktop_ws))
+        .route("/ws/desktop-fallback", get(desktop_fallback_ws))
+        .route("/ws/desktop-vnc", get(desktop_vnc_ws))
         .fallback_service(static_files)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -334,7 +368,10 @@ struct Config {
     desktop_output: String,
     desktop_mode: String,
     desktop_helper: PathBuf,
+    desktop_fallback_helper: PathBuf,
+    wayvnc: Option<PathBuf>,
     forge_session_file: PathBuf,
+    terminal_upload_dir: PathBuf,
 }
 
 impl Config {
@@ -403,6 +440,13 @@ impl Config {
         let desktop_helper = env::var_os("EUTHERGATE_DESKTOP_HELPER")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("scripts/webrtc_desktop.py"));
+        let desktop_fallback_helper = env::var_os("EUTHERGATE_DESKTOP_FALLBACK_HELPER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("scripts/wss_desktop.py"));
+        let wayvnc = env::var_os("EUTHERGATE_WAYVNC_BIN")
+            .map(PathBuf::from)
+            .map(|path| resolve_executable(&path))
+            .unwrap_or_else(|| resolve_executable(Path::new("wayvnc")));
         let forge_session_file = env::var_os("EUTHERGATE_FORGE_SESSION_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -411,6 +455,14 @@ impl Config {
                     .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", nix_uid())));
                 runtime_dir.join("euthergate-forge/session.env")
             });
+        let terminal_upload_dir = env::var_os("EUTHERGATE_TERMINAL_UPLOAD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                env::temp_dir()
+                    .join(format!("euthergate-{}", nix_uid()))
+                    .join("terminal-images")
+            });
+        prepare_private_directory(&terminal_upload_dir)?;
 
         Ok(Self {
             bind,
@@ -425,7 +477,10 @@ impl Config {
             desktop_output,
             desktop_mode,
             desktop_helper,
+            desktop_fallback_helper,
+            wayvnc,
             forge_session_file,
+            terminal_upload_dir,
         })
     }
 }
@@ -651,6 +706,85 @@ async fn terminal_socket(socket: WebSocket, terminal: Arc<TerminalSession>) {
     }
 }
 
+async fn terminal_image_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some((mime, extension)) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(terminal_image_format)
+    else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(
+                serde_json::json!({ "error": "terminal paste supports PNG, JPEG and WebP images" }),
+            ),
+        )
+            .into_response();
+    };
+    if body.is_empty() || !valid_image_signature(mime, body.as_ref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "clipboard data is not a valid image" })),
+        )
+            .into_response();
+    }
+
+    let upload_dir = state.terminal_upload_dir.clone();
+    let size = body.len();
+    let result = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        prepare_private_directory(upload_dir.as_ref())?;
+        for _ in 0..4 {
+            let path = upload_dir.join(format!("paste-{}.{}", random_secret(9), extension));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(body.as_ref())?;
+                    file.sync_all()?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("could not allocate a unique terminal image name")
+    })
+    .await;
+
+    match result {
+        Ok(Ok(path)) => {
+            info!(path = %path.display(), size, "stored terminal clipboard image");
+            Json(TerminalImageUploadResponse {
+                path: path.to_string_lossy().into_owned(),
+                mime,
+                size,
+            })
+            .into_response()
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "could not store terminal clipboard image");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "could not store clipboard image" })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            error!(%error, "terminal image upload task failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn display_wake(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -765,6 +899,7 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         .and_then(TurnConfig::ice_server)
         .into_iter()
         .collect();
+    let transport_profiles = transport_profiles(state.turn.as_deref(), desktop.wayvnc.is_some());
     Json(DesktopStatusResponse {
         available: desktop.helper.is_file(),
         active: desktop.active.load(Ordering::Acquire),
@@ -778,6 +913,7 @@ async fn desktop_status(State(state): State<AppState>, headers: HeaderMap) -> Re
         virtual_output: selection.virtual_output,
         outputs,
         ice_servers,
+        transport_profiles,
     })
     .into_response()
 }
@@ -944,6 +1080,85 @@ async fn desktop_ws(
         desktop.viewer_connected.store(false, Ordering::Release);
     })
     .into_response()
+}
+
+async fn desktop_fallback_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.desktop.active.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "desktop capture is not active").into_response();
+    }
+    if !state.desktop.fallback_helper.is_file() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HTTPS/WSS desktop helper is unavailable",
+        )
+            .into_response();
+    }
+    if state
+        .desktop
+        .viewer_connected
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "a desktop viewer is already connected",
+        )
+            .into_response();
+    }
+    let desktop = state.desktop.clone();
+    ws.max_message_size(256 * 1024)
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = desktop_fallback_socket(socket, desktop.clone()).await {
+                error!(%error, "desktop HTTPS/WSS bridge stopped");
+            }
+            desktop.viewer_connected.store(false, Ordering::Release);
+        })
+        .into_response()
+}
+
+async fn desktop_vnc_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.desktop.active.load(Ordering::Acquire) {
+        return (StatusCode::CONFLICT, "desktop capture is not active").into_response();
+    }
+    if state.desktop.wayvnc.is_none() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WayVNC is unavailable").into_response();
+    }
+    if state
+        .desktop
+        .viewer_connected
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "a desktop viewer is already connected",
+        )
+            .into_response();
+    }
+    let desktop = state.desktop.clone();
+    ws.max_message_size(16 * 1024 * 1024)
+        .max_frame_size(16 * 1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = desktop_vnc_socket(socket, desktop.clone()).await {
+                error!(%error, "desktop VNC/WSS bridge stopped");
+            }
+            desktop.viewer_connected.store(false, Ordering::Release);
+        })
+        .into_response()
 }
 
 impl DesktopManager {
@@ -1515,6 +1730,52 @@ fn supported_upload_mime(content_type: &str) -> Option<&'static str> {
     }
 }
 
+fn terminal_image_format(content_type: &str) -> Option<(&'static str, &'static str)> {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/png" => Some(("image/png", "png")),
+        "image/jpeg" => Some(("image/jpeg", "jpg")),
+        "image/webp" => Some(("image/webp", "webp")),
+        _ => None,
+    }
+}
+
+fn valid_image_signature(mime: &str, data: &[u8]) -> bool {
+    match mime {
+        "image/png" => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => data.starts_with(b"\xff\xd8\xff"),
+        "image/webp" => data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn prepare_private_directory(path: &Path) -> Result<()> {
+    if !path.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .with_context(|| format!("could not create {}", path.display()))?;
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "{} must be a directory, not a symlink or file",
+            path.display()
+        );
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("could not secure {}", path.display()))?;
+    Ok(())
+}
+
 fn read_forge_session(path: &Path) -> Result<ForgeSession> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("could not read {}", path.display()))?;
@@ -1628,6 +1889,321 @@ async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Resu
     Ok(())
 }
 
+async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+    let selection = desktop.selection();
+    let (backend_name, wayland_display, backend_environment) = match &selection.backend {
+        DesktopBackend::Hyprland {
+            signature,
+            wayland_display,
+        } => (
+            "hyprland",
+            wayland_display,
+            Some(("HYPRLAND_INSTANCE_SIGNATURE", signature)),
+        ),
+        DesktopBackend::Sway {
+            wayland_display,
+            sway_socket,
+        } => ("sway", wayland_display, Some(("SWAYSOCK", sway_socket))),
+        DesktopBackend::Unavailable => anyhow::bail!("selected Wayland session is unavailable"),
+    };
+    let mut command = Command::new("python");
+    command
+        .arg(&desktop.fallback_helper)
+        .args([
+            "--backend",
+            backend_name,
+            "--output",
+            &selection.capture_output,
+            "--mode",
+            &selection.mode,
+        ])
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if let Some((name, value)) = backend_environment {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start {}", desktop.fallback_helper.display()))?;
+    let mut child_input = child
+        .stdin
+        .take()
+        .context("HTTPS/WSS helper stdin unavailable")?;
+    let child_output = child
+        .stdout
+        .take()
+        .context("HTTPS/WSS helper stdout unavailable")?;
+    let mut child_output = BufReader::new(child_output);
+    let (mut sender, mut receiver) = socket.split();
+
+    loop {
+        tokio::select! {
+            packet = read_fallback_packet(&mut child_output) => match packet {
+                Ok(Some((1, payload))) => {
+                    if sender.send(Message::Binary(payload.into())).await.is_err() { break; }
+                }
+                Ok(Some((2, payload))) => {
+                    let text = String::from_utf8(payload).context("fallback helper returned invalid JSON text")?;
+                    if sender.send(Message::Text(text.into())).await.is_err() { break; }
+                }
+                Ok(Some((kind, _))) => anyhow::bail!("fallback helper returned unknown packet type {kind}"),
+                Ok(None) => break,
+                Err(error) => return Err(error).context("could not read HTTPS/WSS helper output"),
+            },
+            message = receiver.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    child_input.write_all(text.as_bytes()).await?;
+                    child_input.write_all(b"\n").await?;
+                    child_input.flush().await?;
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    warn!(%error, "desktop HTTPS/WSS socket disconnected");
+                    break;
+                }
+            },
+            status = child.wait() => {
+                let status = status.context("could not wait for HTTPS/WSS helper")?;
+                anyhow::bail!("HTTPS/WSS helper exited with {status}");
+            }
+        }
+    }
+
+    let _ = child_input.write_all(b"{\"type\":\"stop\"}\n").await;
+    drop(child_input);
+    if tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    Ok(())
+}
+
+async fn desktop_vnc_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+    let selection = desktop.selection();
+    let (wayland_display, backend_environment) = match &selection.backend {
+        DesktopBackend::Hyprland {
+            signature,
+            wayland_display,
+        } => (
+            wayland_display,
+            Some(("HYPRLAND_INSTANCE_SIGNATURE", signature)),
+        ),
+        DesktopBackend::Sway {
+            wayland_display,
+            sway_socket,
+        } => (wayland_display, Some(("SWAYSOCK", sway_socket))),
+        DesktopBackend::Unavailable => anyhow::bail!("selected Wayland session is unavailable"),
+    };
+    let wayvnc = desktop
+        .wayvnc
+        .as_ref()
+        .context("WayVNC executable is unavailable")?;
+    let _idle_hold = start_vnc_idle_hold();
+    wake_vnc_output(&selection).await?;
+    let socket_id = random_secret(12);
+    let rfb_socket = env::temp_dir().join(format!("euthergate-vnc-{socket_id}.sock"));
+    let control_socket = env::temp_dir().join(format!("euthergate-vncctl-{socket_id}.sock"));
+    let _socket_cleanup = VncSocketCleanup {
+        rfb_socket: rfb_socket.clone(),
+        control_socket: control_socket.clone(),
+    };
+    let mut command = Command::new(wayvnc);
+    command
+        .args(["--exit-on-disconnect", "--unix-socket"])
+        .arg("--output")
+        .arg(&selection.capture_output)
+        .arg("--socket")
+        .arg(&control_socket)
+        .arg("--name")
+        .arg("EutherGate Forge")
+        .arg(&rfb_socket)
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if let Some((name, value)) = backend_environment {
+        command.env(name, value);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("could not start {}", wayvnc.display()))?;
+
+    let connect_result = timeout(Duration::from_secs(4), async {
+        loop {
+            match UnixStream::connect(&rfb_socket).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => {
+                    if let Some(status) = child.try_wait().context("could not inspect WayVNC")? {
+                        anyhow::bail!("WayVNC exited with {status}: {error}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    })
+    .await;
+    let stream = match connect_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            remove_vnc_sockets(&rfb_socket, &control_socket);
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            remove_vnc_sockets(&rfb_socket, &control_socket);
+            anyhow::bail!("WayVNC did not create its private socket within four seconds");
+        }
+    };
+
+    let (mut vnc_reader, mut vnc_writer) = stream.into_split();
+    let (mut sender, mut receiver) = socket.split();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    loop {
+        tokio::select! {
+            read = vnc_reader.read(&mut buffer) => match read {
+                Ok(0) => break,
+                Ok(length) => {
+                    if sender.send(Message::Binary(buffer[..length].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => return Err(error).context("could not read private WayVNC socket"),
+            },
+            message = receiver.next() => match message {
+                Some(Ok(Message::Binary(data))) => {
+                    vnc_writer.write_all(&data).await?;
+                    vnc_writer.flush().await?;
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    warn!(%error, "desktop VNC WebSocket disconnected");
+                    break;
+                }
+            },
+            status = child.wait() => {
+                let status = status.context("could not wait for WayVNC")?;
+                anyhow::bail!("WayVNC exited with {status}");
+            }
+        }
+    }
+
+    drop(vnc_writer);
+    if timeout(Duration::from_secs(2), child.wait()).await.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    remove_vnc_sockets(&rfb_socket, &control_socket);
+    Ok(())
+}
+
+fn start_vnc_idle_hold() -> Option<tokio::process::Child> {
+    match Command::new("systemd-inhibit")
+        .args([
+            "--what=idle",
+            "--mode=block",
+            "--why=EutherGate active VNC desktop session",
+            "sleep",
+            "infinity",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => Some(child),
+        Err(error) => {
+            warn!(%error, "could not inhibit display idle during VNC session");
+            None
+        }
+    }
+}
+
+async fn wake_vnc_output(selection: &DesktopSelection) -> Result<()> {
+    match &selection.backend {
+        DesktopBackend::Hyprland { signature, .. } => {
+            hyprctl_instance(
+                signature,
+                &["dispatch", "dpms", "on", &selection.capture_output],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "could not wake Hyprland output {} for VNC capture",
+                    selection.capture_output
+                )
+            })?;
+        }
+        DesktopBackend::Sway { sway_socket, .. } => {
+            swayctl(
+                sway_socket,
+                &["output", &selection.capture_output, "power", "on"],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "could not wake Sway output {} for VNC capture",
+                    selection.capture_output
+                )
+            })?;
+        }
+        DesktopBackend::Unavailable => {
+            anyhow::bail!("selected Wayland session is unavailable");
+        }
+    }
+    info!(output = %selection.capture_output, "VNC output awake with idle inhibited");
+    Ok(())
+}
+
+fn remove_vnc_sockets(rfb_socket: &Path, control_socket: &Path) {
+    for path in [rfb_socket, control_socket] {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), %error, "could not remove private WayVNC socket");
+        }
+    }
+}
+
+struct VncSocketCleanup {
+    rfb_socket: PathBuf,
+    control_socket: PathBuf,
+}
+
+impl Drop for VncSocketCleanup {
+    fn drop(&mut self) {
+        remove_vnc_sockets(&self.rfb_socket, &self.control_socket);
+    }
+}
+
+async fn read_fallback_packet<R>(reader: &mut R) -> Result<Option<(u8, Vec<u8>)>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut header = [0_u8; FALLBACK_PACKET_HEADER_BYTES];
+    match reader.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let length = u32::from_be_bytes(header[1..5].try_into().expect("four-byte length")) as usize;
+    if length > FALLBACK_MAX_PACKET_BYTES {
+        anyhow::bail!("fallback packet exceeds {FALLBACK_MAX_PACKET_BYTES} bytes");
+    }
+    let mut payload = vec![0_u8; length];
+    reader.read_exact(&mut payload).await?;
+    Ok(Some((header[0], payload)))
+}
+
 fn is_authenticated(headers: &HeaderMap, state: &AppState) -> bool {
     authentication_mode(headers, state) != "none"
 }
@@ -1705,6 +2281,107 @@ impl TurnConfig {
     }
 }
 
+fn transport_profiles(turn: Option<&TurnConfig>, wayvnc_available: bool) -> Vec<TransportProfile> {
+    let all_urls = turn.map(|config| config.urls.clone()).unwrap_or_default();
+    let mut profiles = vec![
+        TransportProfile {
+            id: "auto",
+            label: "AUTO",
+            description: "Direct WebRTC first, with every configured relay available as fallback.",
+            ice_transport_policy: "all",
+            urls: all_urls,
+        },
+        TransportProfile {
+            id: "direct",
+            label: "DIRECT / LAN",
+            description: "Direct WebRTC only. Intended for the same LAN or a trusted VPN.",
+            ice_transport_policy: "all",
+            urls: Vec::new(),
+        },
+        TransportProfile {
+            id: "https-wss",
+            label: "WORK · HTTPS/WSS",
+            description: "JPEG desktop frames and input over the authenticated HTTPS WebSocket path.",
+            ice_transport_policy: "all",
+            urls: Vec::new(),
+        },
+    ];
+
+    if wayvnc_available {
+        profiles.push(TransportProfile {
+            id: "vnc-wss",
+            label: "WORK · VNC/WSS",
+            description: "WayVNC changed regions and input over the authenticated HTTPS WebSocket path.",
+            ice_transport_policy: "all",
+            urls: Vec::new(),
+        });
+    }
+
+    let Some(turn) = turn else {
+        return profiles;
+    };
+
+    type UrlMatcher = fn(&str) -> bool;
+    let definitions: [(&str, &str, &str, UrlMatcher); 4] = [
+        (
+            "turn-tls-443",
+            "WORK · TURN/TLS 443",
+            "Relay-only TURN secured with TLS over TCP port 443.",
+            |url: &str| {
+                let url = url.to_ascii_lowercase();
+                url.starts_with("turns:") && url.contains(":443") && url.contains("transport=tcp")
+            },
+        ),
+        (
+            "turn-udp-443",
+            "TURN/UDP 443",
+            "Relay-only TURN over UDP port 443; usually the fastest relay path.",
+            |url: &str| {
+                let url = url.to_ascii_lowercase();
+                url.starts_with("turn:") && url.contains(":443") && url.contains("transport=udp")
+            },
+        ),
+        (
+            "turn-tcp-3478",
+            "TURN/TCP 3478",
+            "Relay-only TURN over TCP on the standard TURN port.",
+            |url: &str| {
+                let url = url.to_ascii_lowercase();
+                url.starts_with("turn:") && url.contains(":3478") && url.contains("transport=tcp")
+            },
+        ),
+        (
+            "turn-udp-3478",
+            "TURN/UDP 3478",
+            "Relay-only TURN over UDP on the standard TURN port.",
+            |url: &str| {
+                let url = url.to_ascii_lowercase();
+                url.starts_with("turn:") && url.contains(":3478") && url.contains("transport=udp")
+            },
+        ),
+    ];
+
+    for (id, label, description, matches) in definitions {
+        let urls = turn
+            .urls
+            .iter()
+            .filter(|url| matches(url))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !urls.is_empty() {
+            profiles.push(TransportProfile {
+                id,
+                label,
+                description,
+                ice_transport_policy: "relay",
+                urls,
+            });
+        }
+    }
+
+    profiles
+}
+
 fn env_bool(name: &str, default: bool) -> Result<bool> {
     match env::var(name) {
         Ok(value) if matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
@@ -1717,6 +2394,23 @@ fn env_bool(name: &str, default: bool) -> Result<bool> {
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(error.into()),
     }
+}
+
+fn resolve_executable(path: &Path) -> Option<PathBuf> {
+    if path.components().count() > 1 {
+        return is_executable(path).then(|| path.to_path_buf());
+    }
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(path))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 fn nix_uid() -> u32 {
@@ -1777,6 +2471,51 @@ mod tests {
         assert!(server.username.ends_with(":euthergate"));
         assert!(!server.credential.is_empty());
         assert!(!server.credential.contains("shared-secret"));
+    }
+
+    #[test]
+    fn transport_profiles_separate_each_configured_turn_route() {
+        let turn = TurnConfig {
+            urls: vec![
+                "turns:turn.example.test:443?transport=tcp".into(),
+                "turn:turn.example.test:443?transport=udp".into(),
+                "turn:turn.example.test:3478?transport=tcp".into(),
+                "turn:turn.example.test:3478?transport=udp".into(),
+            ],
+            shared_secret: Arc::from("shared-secret"),
+        };
+        let profiles = transport_profiles(Some(&turn), true);
+        assert_eq!(profiles[0].id, "auto");
+        assert_eq!(profiles[0].urls, turn.urls);
+        assert_eq!(profiles[1].id, "direct");
+        assert!(profiles[1].urls.is_empty());
+        assert_eq!(profiles[2].id, "https-wss");
+        assert!(profiles[2].urls.is_empty());
+        assert_eq!(profiles[3].id, "vnc-wss");
+        assert!(profiles[3].urls.is_empty());
+        for profile in &profiles[4..] {
+            assert_eq!(profile.ice_transport_policy, "relay");
+            assert_eq!(profile.urls.len(), 1);
+        }
+        assert_eq!(profiles[4].id, "turn-tls-443");
+        assert!(profiles[4].urls[0].starts_with("turns:"));
+        assert_eq!(profiles[5].id, "turn-udp-443");
+        assert_eq!(profiles[6].id, "turn-tcp-3478");
+        assert_eq!(profiles[7].id, "turn-udp-3478");
+    }
+
+    #[test]
+    fn vnc_profile_only_appears_when_wayvnc_is_available() {
+        assert!(
+            transport_profiles(None, false)
+                .iter()
+                .all(|profile| profile.id != "vnc-wss")
+        );
+        assert!(
+            transport_profiles(None, true)
+                .iter()
+                .any(|profile| profile.id == "vnc-wss")
+        );
     }
 
     #[test]
@@ -1892,5 +2631,36 @@ mod tests {
         assert_eq!(supported_upload_mime("IMAGE/PNG"), Some("image/png"));
         assert_eq!(supported_upload_mime("image/svg+xml"), None);
         assert_eq!(supported_upload_mime("application/octet-stream"), None);
+    }
+
+    #[test]
+    fn terminal_image_uploads_require_supported_magic_bytes() {
+        assert_eq!(
+            terminal_image_format("image/png"),
+            Some(("image/png", "png"))
+        );
+        assert_eq!(
+            terminal_image_format("IMAGE/JPEG; charset=binary"),
+            Some(("image/jpeg", "jpg"))
+        );
+        assert_eq!(terminal_image_format("image/gif"), None);
+        assert!(valid_image_signature("image/png", b"\x89PNG\r\n\x1a\nrest"));
+        assert!(valid_image_signature(
+            "image/webp",
+            b"RIFF\x04\x00\x00\x00WEBP"
+        ));
+        assert!(!valid_image_signature("image/jpeg", b"not a jpeg"));
+    }
+
+    #[test]
+    fn terminal_image_directory_is_private() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested").join("terminal-images");
+        prepare_private_directory(&path).unwrap();
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

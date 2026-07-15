@@ -1,5 +1,6 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import RFB from "@novnc/novnc";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
@@ -22,6 +23,15 @@ type DesktopStatus = {
   virtual_output: boolean;
   outputs: DesktopOutput[];
   ice_servers: RTCIceServer[];
+  transport_profiles: DesktopTransportProfile[];
+};
+
+type DesktopTransportProfile = {
+  id: string;
+  label: string;
+  description: string;
+  ice_transport_policy: RTCIceTransportPolicy;
+  urls: string[];
 };
 
 type DesktopOutput = {
@@ -62,8 +72,15 @@ let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
 let desktopIceServers: RTCIceServer[] = [];
+let activeDesktopIceServers: RTCIceServer[] = [];
+let desktopTransportProfiles: DesktopTransportProfile[] = [];
 let desktopVideoReady = false;
+let desktopFallbackActive = false;
+let desktopVncActive = false;
+let vnc: RFB | null = null;
+let desktopFallbackFrameUrl: string | null = null;
 let desktopNegotiationTimer: number | null = null;
+let desktopVncRetryTimer: number | null = null;
 let desktopControlActive = false;
 let desktopIceCandidates: string[] = [];
 let desktopIceErrors: string[] = [];
@@ -73,6 +90,7 @@ let clipboardPreviewUrl: string | null = null;
 let remoteClipboardBlob: Blob | null = null;
 
 const clipboardLimit = 8 * 1024 * 1024;
+const transportPreferenceKey = "euthergate.transport-profile";
 
 const gateRoot = new URL("./", document.baseURI);
 
@@ -133,6 +151,7 @@ function renderTerminal(): void {
         <div class="actions">
           <span id="socket-state" class="socket-state">CONNECTING</span>
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
+          <button id="terminal-image-button" class="ghost-button" type="button">PASTE IMAGE</button>
           <button id="show-desktop" class="ghost-button primary-action" type="button">DESKTOP</button>
           ${proxiedSession ? "" : '<button id="logout" class="ghost-button" type="button">CLOSE GATE</button>'}
         </div>
@@ -141,7 +160,8 @@ function renderTerminal(): void {
         <div class="terminal-chrome"><span></span><span></span><span></span><b>euthergate://local/shell</b></div>
         <div id="terminal" aria-label="EutherGate terminal"></div>
       </div>
-      <p class="hint">The shell remains alive when this page is reloaded.</p>
+      <input id="terminal-image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+      <p id="terminal-image-status" class="hint">Ctrl+V pastes clipboard images as a private file path. The shell remains alive when this page is reloaded.</p>
     </section>`);
 
   terminal = new Terminal({
@@ -169,6 +189,11 @@ function renderTerminal(): void {
   terminal.open(document.querySelector<HTMLDivElement>("#terminal")!);
   fitAddon.fit();
 
+  const terminalNode = document.querySelector<HTMLDivElement>("#terminal")!;
+  terminalNode.addEventListener("paste", pasteImageIntoTerminal, { capture: true });
+  terminalNode.addEventListener("dragover", (event) => event.preventDefault());
+  terminalNode.addEventListener("drop", dropImageIntoTerminal);
+
   terminal.onData((data) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
   });
@@ -176,8 +201,66 @@ function renderTerminal(): void {
   window.addEventListener("resize", fitTerminal);
   document.querySelector<HTMLButtonElement>("#logout")?.addEventListener("click", logout);
   document.querySelector<HTMLButtonElement>(".wake-screens")?.addEventListener("click", wakeScreens);
+  document.querySelector<HTMLButtonElement>("#terminal-image-button")?.addEventListener("click", chooseTerminalImage);
+  document.querySelector<HTMLInputElement>("#terminal-image-input")?.addEventListener("change", selectTerminalImage);
   document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
   connectSocket();
+}
+
+function chooseTerminalImage(): void {
+  document.querySelector<HTMLInputElement>("#terminal-image-input")?.click();
+}
+
+function selectTerminalImage(event: Event): void {
+  const input = event.currentTarget as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (file) void uploadTerminalImage(file);
+}
+
+function pasteImageIntoTerminal(event: ClipboardEvent): void {
+  const image = Array.from(event.clipboardData?.items || [])
+    .find((item) => item.kind === "file" && item.type.startsWith("image/"))
+    ?.getAsFile();
+  if (!image) return;
+  event.preventDefault();
+  event.stopPropagation();
+  void uploadTerminalImage(image);
+}
+
+function dropImageIntoTerminal(event: DragEvent): void {
+  const image = Array.from(event.dataTransfer?.files || [])
+    .find((file) => file.type.startsWith("image/"));
+  if (!image) return;
+  event.preventDefault();
+  void uploadTerminalImage(image);
+}
+
+async function uploadTerminalImage(image: File): Promise<void> {
+  setTerminalImageStatus(`Uploading ${image.name || "clipboard image"}…`);
+  try {
+    if (image.size > clipboardLimit) throw new Error("Image exceeds the 8 MiB limit.");
+    const response = await fetch(gateUrl("api/terminal/image"), {
+      method: "POST",
+      headers: { "content-type": image.type },
+      body: image,
+    });
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    if (!response.ok) throw new Error(await responseError(response, "Could not upload clipboard image."));
+    const result = (await response.json()) as { path: string; size: number };
+    terminal?.focus();
+    terminal?.paste(result.path);
+    setTerminalImageStatus(`Image ready and path pasted: ${result.path}`);
+  } catch (error) {
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not upload clipboard image.", true);
+  }
+}
+
+function setTerminalImageStatus(message: string, failed = false): void {
+  const status = document.querySelector<HTMLParagraphElement>("#terminal-image-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", failed);
 }
 
 async function renderDesktop(): Promise<void> {
@@ -193,6 +276,7 @@ async function renderDesktop(): Promise<void> {
           <span id="desktop-state" class="socket-state">PROBING</span>
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <select id="desktop-output-picker" class="output-picker" aria-label="Wayland output" disabled></select>
+          <select id="desktop-transport-picker" class="output-picker transport-picker" aria-label="Connection protocol" disabled></select>
           <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
           <button id="desktop-clipboard" class="ghost-button" type="button" disabled>CLIPBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
@@ -220,10 +304,12 @@ async function renderDesktop(): Promise<void> {
       </aside>
       <div class="desktop-frame" id="desktop-frame" tabindex="0">
         <video id="desktop-video" autoplay playsinline muted></video>
+        <img id="desktop-fallback-image" alt="Remote desktop over HTTPS WebSocket" hidden />
+        <div id="desktop-vnc" aria-label="Remote desktop over VNC WebSocket" hidden></div>
         <div class="desktop-empty" id="desktop-empty">
           <span class="brand-mark large" aria-hidden="true"><i></i></span>
           <strong>Virtual Wayland output offline</strong>
-          <p>Start the headless forge, then video and input travel over WebRTC.</p>
+          <p>Start the headless forge, then choose WebRTC or the HTTPS/WSS fallback.</p>
         </div>
         <div class="stream-hud">
           <span id="desktop-output">EUTHERGATE-1</span>
@@ -246,6 +332,7 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
+  document.querySelector<HTMLSelectElement>("#desktop-transport-picker")?.addEventListener("change", switchDesktopTransport);
   installClipboardBridge();
   installDesktopInput();
 
@@ -264,6 +351,7 @@ async function renderDesktop(): Promise<void> {
 
 function updateDesktopStatus(status: DesktopStatus): void {
   desktopIceServers = status.ice_servers || [];
+  desktopTransportProfiles = status.transport_profiles || [];
   const power = document.querySelector<HTMLButtonElement>("#desktop-power");
   if (power) {
     power.disabled = !status.available;
@@ -283,6 +371,16 @@ function updateDesktopStatus(status: DesktopStatus): void {
       return `<option value="${escapeHtml(candidate.id)}"${candidate.id === status.output_id ? " selected" : ""}>${escapeHtml(label)}</option>`;
     }).join("");
     picker.disabled = false;
+  }
+  const transportPicker = document.querySelector<HTMLSelectElement>("#desktop-transport-picker");
+  if (transportPicker) {
+    const preferred = loadTransportPreference();
+    const selected = desktopTransportProfiles.some((profile) => profile.id === preferred) ? preferred : "auto";
+    transportPicker.innerHTML = desktopTransportProfiles.map((profile) =>
+      `<option value="${escapeHtml(profile.id)}" title="${escapeHtml(profile.description)}"${profile.id === selected ? " selected" : ""}>${escapeHtml(profile.label)}</option>`
+    ).join("");
+    transportPicker.disabled = desktopTransportProfiles.length < 2;
+    transportPicker.title = selectedTransportProfile()?.description || "Connection protocol";
   }
   const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
   if (terminalButton) terminalButton.disabled = !status.active;
@@ -350,6 +448,22 @@ async function switchDesktopOutput(): Promise<void> {
   } finally {
     picker.disabled = false;
   }
+}
+
+async function switchDesktopTransport(): Promise<void> {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-transport-picker");
+  const power = document.querySelector<HTMLButtonElement>("#desktop-power");
+  if (!picker) return;
+  saveTransportPreference(picker.value);
+  picker.title = selectedTransportProfile()?.description || "Connection protocol";
+  resetIceDiagnostics();
+  if (!power || power.dataset.active !== "true") return;
+  picker.disabled = true;
+  setDesktopState("CHANGING PROTOCOL");
+  disposeDesktop();
+  await new Promise((resolve) => window.setTimeout(resolve, 250));
+  connectDesktop();
+  picker.disabled = false;
 }
 
 async function launchDesktopTerminal(): Promise<void> {
@@ -568,13 +682,28 @@ async function responseError(response: Response, fallback: string): Promise<stri
 
 function connectDesktop(): void {
   disposeDesktop();
-  socket = new WebSocket(gateWebSocket("ws/desktop"));
   remoteCandidates = [];
   desktopVideoReady = false;
   resetIceDiagnostics();
-  setDesktopState("NEGOTIATING");
 
-  peer = new RTCPeerConnection({ bundlePolicy: "max-bundle", iceServers: desktopIceServers });
+  const profile = selectedTransportProfile();
+  if (profile?.id === "vnc-wss") {
+    connectVncDesktop();
+    return;
+  }
+  if (profile?.id === "https-wss") {
+    connectFallbackDesktop();
+    return;
+  }
+
+  socket = new WebSocket(gateWebSocket("ws/desktop"));
+  setDesktopState("NEGOTIATING");
+  activeDesktopIceServers = iceServersForProfile(profile);
+  peer = new RTCPeerConnection({
+    bundlePolicy: "max-bundle",
+    iceServers: activeDesktopIceServers,
+    iceTransportPolicy: profile?.ice_transport_policy || "all",
+  });
   peer.addTransceiver("video", { direction: "recvonly" });
   // Position must arrive before its click, and modifiers before their key.
   // SCTP's reliable ordered mode is still independent of the video stream.
@@ -664,6 +793,129 @@ function connectDesktop(): void {
   });
 }
 
+function connectVncDesktop(attempt = 0): void {
+  desktopVncActive = true;
+  activeDesktopIceServers = [];
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  const target = document.querySelector<HTMLDivElement>("#desktop-vnc");
+  if (!target) {
+    setDesktopState("VNC UNAVAILABLE");
+    return;
+  }
+  if (video) video.hidden = true;
+  target.hidden = false;
+  updateIceDiagnostics();
+  setDesktopState("CONNECTING VNC/WSS");
+
+  // noVNC measures its target when scaleViewport is enabled. Wait until the
+  // previously hidden target has a definite laid-out size before constructing
+  // RFB, otherwise its canvas can remain at a zero-sized black viewport.
+  window.requestAnimationFrame(() => {
+    if (!desktopVncActive || !target.isConnected) return;
+    target.replaceChildren();
+    const session = new RFB(target, gateWebSocket("ws/desktop-vnc").toString(), { shared: false });
+    vnc = session;
+    session.background = "#050608";
+    session.scaleViewport = true;
+    session.resizeSession = false;
+    session.qualityLevel = 7;
+    session.compressionLevel = 5;
+    session.addEventListener("connect", () => {
+      if (vnc !== session) return;
+      desktopVideoReady = true;
+      hideDesktopMessage();
+      setDesktopState("LIVE");
+      const transport = document.querySelector<HTMLElement>("#desktop-transport");
+      if (transport) transport.textContent = "RFB / WSS";
+      session.focus();
+    });
+    session.addEventListener("disconnect", (event) => {
+      if (vnc !== session) return;
+      vnc = null;
+      const clean = Boolean((event as CustomEvent<{ clean?: boolean }>).detail?.clean);
+      if (!clean && desktopVncActive && attempt < 3) {
+        const delay = 400 * (2 ** attempt);
+        setDesktopState("RETRYING VNC/WSS");
+        desktopVncRetryTimer = window.setTimeout(() => {
+          desktopVncRetryTimer = null;
+          if (desktopVncActive) connectVncDesktop(attempt + 1);
+        }, delay);
+        return;
+      }
+      setDesktopState(clean ? "DISCONNECTED" : "VNC FAILED");
+      if (!clean) showDesktopMessage("The authenticated VNC/WSS desktop connection failed.");
+    });
+    session.addEventListener("securityfailure", (event) => {
+      if (vnc !== session) return;
+      const reason = String((event as CustomEvent<{ reason?: string }>).detail?.reason || "VNC security negotiation failed.");
+      setDesktopState("VNC REJECTED");
+      showDesktopMessage(reason);
+    });
+  });
+}
+
+function connectFallbackDesktop(): void {
+  desktopFallbackActive = true;
+  activeDesktopIceServers = [];
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  const image = document.querySelector<HTMLImageElement>("#desktop-fallback-image");
+  if (video) video.hidden = true;
+  if (image) image.hidden = false;
+  updateIceDiagnostics();
+  setDesktopState("CONNECTING HTTPS/WSS");
+
+  const fallbackSocket = new WebSocket(gateWebSocket("ws/desktop-fallback"));
+  fallbackSocket.binaryType = "arraybuffer";
+  socket = fallbackSocket;
+  fallbackSocket.addEventListener("open", () => {
+    if (socket !== fallbackSocket) return;
+    setDesktopState("WAITING FOR HTTPS/WSS VIDEO");
+    desktopNegotiationTimer = window.setTimeout(() => {
+      if (!desktopVideoReady && socket === fallbackSocket) {
+        setDesktopState("NO VIDEO");
+        showDesktopMessage("No HTTPS/WSS desktop frame arrived within 8 seconds.");
+      }
+    }, 8000);
+  });
+  fallbackSocket.addEventListener("message", (event) => {
+    if (socket !== fallbackSocket) return;
+    if (event.data instanceof ArrayBuffer) {
+      showFallbackFrame(event.data);
+      return;
+    }
+    const message = JSON.parse(String(event.data)) as Record<string, unknown>;
+    if (message.type === "ready") {
+      const transport = document.querySelector<HTMLElement>("#desktop-transport");
+      if (transport) transport.textContent = `${String(message.codec)} / WSS INPUT`;
+    } else if (message.type === "error" || message.type === "fatal") {
+      showDesktopMessage(String(message.message || "HTTPS/WSS desktop failure"));
+      setDesktopState("FAULT");
+    } else if (message.type === "capture-warning" || message.type === "input-warning") {
+      console.warn("EutherGate HTTPS/WSS desktop:", message.message);
+    }
+  });
+  fallbackSocket.addEventListener("close", () => {
+    if (socket === fallbackSocket) setDesktopState("DISCONNECTED");
+  });
+  fallbackSocket.addEventListener("error", () => {
+    if (socket === fallbackSocket) {
+      setDesktopState("WSS FAILED");
+      showDesktopMessage("The authenticated HTTPS/WSS desktop connection failed.");
+    }
+  });
+}
+
+function showFallbackFrame(frame: ArrayBuffer): void {
+  const image = document.querySelector<HTMLImageElement>("#desktop-fallback-image");
+  if (!image) return;
+  if (desktopFallbackFrameUrl) URL.revokeObjectURL(desktopFallbackFrameUrl);
+  desktopFallbackFrameUrl = URL.createObjectURL(new Blob([frame], { type: "image/jpeg" }));
+  image.addEventListener("load", () => {
+    if (!desktopVideoReady) markDesktopVideoReady();
+  }, { once: true });
+  image.src = desktopFallbackFrameUrl;
+}
+
 function resetIceDiagnostics(): void {
   desktopIceCandidates = [];
   desktopIceErrors = [];
@@ -672,7 +924,40 @@ function resetIceDiagnostics(): void {
 }
 
 function iceServerUrls(): string[] {
-  return desktopIceServers.flatMap((server) => typeof server.urls === "string" ? [server.urls] : server.urls);
+  return activeDesktopIceServers.flatMap((server) => typeof server.urls === "string" ? [server.urls] : server.urls);
+}
+
+function selectedTransportProfile(): DesktopTransportProfile | undefined {
+  const picker = document.querySelector<HTMLSelectElement>("#desktop-transport-picker");
+  const id = picker?.value || loadTransportPreference();
+  return desktopTransportProfiles.find((profile) => profile.id === id)
+    || desktopTransportProfiles.find((profile) => profile.id === "auto");
+}
+
+function iceServersForProfile(profile: DesktopTransportProfile | undefined): RTCIceServer[] {
+  if (!profile) return desktopIceServers;
+  const allowed = new Set(profile.urls);
+  return desktopIceServers.flatMap((server) => {
+    const urls = (typeof server.urls === "string" ? [server.urls] : server.urls)
+      .filter((url) => allowed.has(url));
+    return urls.length ? [{ ...server, urls }] : [];
+  });
+}
+
+function loadTransportPreference(): string {
+  try {
+    return window.localStorage.getItem(transportPreferenceKey) || "auto";
+  } catch {
+    return "auto";
+  }
+}
+
+function saveTransportPreference(profile: string): void {
+  try {
+    window.localStorage.setItem(transportPreferenceKey, profile);
+  } catch {
+    // Private browsing can deny persistent storage; the current selection still works.
+  }
 }
 
 function describeIceUrl(url: string): string {
@@ -695,6 +980,22 @@ function describeIceCandidate(candidate: RTCIceCandidate): string {
 function updateIceDiagnostics(): void {
   const route = document.querySelector<HTMLElement>("#desktop-ice-route");
   const detail = document.querySelector<HTMLElement>("#desktop-ice-detail");
+  if (desktopVncActive) {
+    if (route) route.textContent = "STREAM ROUTE · authenticated VNC/WSS";
+    if (detail) {
+      detail.textContent = "RFB · private WayVNC Unix socket + WebSocket/TCP 443";
+      detail.classList.remove("error");
+    }
+    return;
+  }
+  if (desktopFallbackActive) {
+    if (route) route.textContent = "STREAM ROUTE · authenticated HTTPS/WSS";
+    if (detail) {
+      detail.textContent = "FALLBACK · JPEG frames + input over WebSocket/TCP 443";
+      detail.classList.remove("error");
+    }
+    return;
+  }
   const gathering = peer?.iceGatheringState || "new";
   if (route) route.textContent = `ICE ROUTE · ${desktopSelectedRoute} · gathering ${gathering}`;
   if (!detail) return;
@@ -751,15 +1052,15 @@ function markDesktopVideoReady(): void {
   if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
   desktopNegotiationTimer = null;
   hideDesktopMessage();
-  setDesktopState(inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
-  void updateSelectedIceRoute();
+  setDesktopState(desktopFallbackActive || inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
+  if (!desktopFallbackActive) void updateSelectedIceRoute();
 }
 
 function installDesktopInput(): void {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
-  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
-  if (!frame || !video) return;
+  if (!frame) return;
   frame.addEventListener("pointermove", (event) => {
+    if (desktopVncActive) return;
     if (!desktopControlActive) return;
     if (document.pointerLockElement === frame) {
       sendDesktopInput({ type: "pointer_delta", dx: event.movementX, dy: event.movementY });
@@ -774,6 +1075,7 @@ function installDesktopInput(): void {
     });
   });
   frame.addEventListener("pointerdown", (event) => {
+    if (desktopVncActive) return;
     if (!desktopVideoReady) return;
     event.preventDefault();
     const position = remotePositionFromClient(event.clientX, event.clientY);
@@ -786,10 +1088,12 @@ function installDesktopInput(): void {
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
   });
   frame.addEventListener("pointerup", (event) => {
+    if (desktopVncActive) return;
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "released" });
   });
   frame.addEventListener("contextmenu", (event) => event.preventDefault());
   frame.addEventListener("wheel", (event) => {
+    if (desktopVncActive) return;
     event.preventDefault();
     sendDesktopInput({ type: "wheel", dx: event.deltaX, dy: event.deltaY });
   }, { passive: false });
@@ -799,6 +1103,7 @@ function installDesktopInput(): void {
 }
 
 function desktopKeyEvent(event: KeyboardEvent): void {
+  if (desktopVncActive) return;
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
   if (!frame || document.activeElement !== frame) return;
   event.preventDefault();
@@ -831,9 +1136,7 @@ function desktopPointerLockChange(): void {
 function releaseDesktopControl(exitPointerLock = true): void {
   if (!desktopControlActive) return;
   desktopControlActive = false;
-  if (desktopVideoReady && inputChannel?.readyState === "open") {
-    inputChannel.send(JSON.stringify({ type: "release_control" }));
-  }
+  if (desktopVideoReady) sendDesktopInput({ type: "release_control" });
   if (exitPointerLock && document.pointerLockElement) document.exitPointerLock();
   document.querySelector<HTMLDivElement>("#desktop-frame")?.blur();
   setDesktopState("LIVE");
@@ -842,9 +1145,10 @@ function releaseDesktopControl(exitPointerLock = true): void {
 function remoteVideoMetrics(): { left: number; top: number; width: number; height: number; sourceWidth: number; sourceHeight: number } | null {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
   const video = document.querySelector<HTMLVideoElement>("#desktop-video");
-  if (!frame || !video) return null;
-  const sourceWidth = video.videoWidth || 1280;
-  const sourceHeight = video.videoHeight || 720;
+  const image = document.querySelector<HTMLImageElement>("#desktop-fallback-image");
+  if (!frame || !video || !image) return null;
+  const sourceWidth = desktopFallbackActive ? (image.naturalWidth || 1280) : (video.videoWidth || 1280);
+  const sourceHeight = desktopFallbackActive ? (image.naturalHeight || 720) : (video.videoHeight || 720);
   const frameWidth = frame.clientWidth;
   const frameHeight = frame.clientHeight;
   if (!frameWidth || !frameHeight) return null;
@@ -873,7 +1177,10 @@ function remotePositionFromClient(clientX: number, clientY: number): { x: number
 }
 
 function sendDesktopInput(message: Record<string, unknown>): void {
-  if (desktopVideoReady && inputChannel?.readyState === "open") inputChannel.send(JSON.stringify(message));
+  if (!desktopVideoReady) return;
+  const payload = JSON.stringify(message);
+  if (desktopFallbackActive && socket?.readyState === WebSocket.OPEN) socket.send(payload);
+  else if (inputChannel?.readyState === "open") inputChannel.send(payload);
 }
 
 function setDesktopState(value: string): void {
@@ -1032,8 +1339,32 @@ function disposeDesktop(): void {
   remoteCandidates = [];
   desktopVideoReady = false;
   desktopControlActive = false;
+  desktopFallbackActive = false;
+  desktopVncActive = false;
+  vnc?.disconnect();
+  vnc = null;
+  if (desktopFallbackFrameUrl) URL.revokeObjectURL(desktopFallbackFrameUrl);
+  desktopFallbackFrameUrl = null;
+  const fallbackImage = document.querySelector<HTMLImageElement>("#desktop-fallback-image");
+  if (fallbackImage) {
+    fallbackImage.removeAttribute("src");
+    fallbackImage.hidden = true;
+  }
+  const video = document.querySelector<HTMLVideoElement>("#desktop-video");
+  if (video) {
+    video.srcObject = null;
+    video.hidden = false;
+  }
+  const vncTarget = document.querySelector<HTMLDivElement>("#desktop-vnc");
+  if (vncTarget) {
+    vncTarget.replaceChildren();
+    vncTarget.hidden = true;
+  }
+  activeDesktopIceServers = [];
   if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
   desktopNegotiationTimer = null;
+  if (desktopVncRetryTimer !== null) window.clearTimeout(desktopVncRetryTimer);
+  desktopVncRetryTimer = null;
 }
 
 function escapeHtml(value: string): string {

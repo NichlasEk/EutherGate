@@ -96,6 +96,13 @@ EUTHERGATE_TOKEN=your-token python scripts/smoke_terminal.py
 
 It requires the Python `websockets` package.
 
+While using Gate Shell, paste a PNG, JPEG or WebP image directly into the
+terminal with Ctrl+V. EutherGate stores it in a private per-user temporary
+directory and inserts the absolute file path into the active terminal input, so
+Codex or another terminal tool can open it. **PASTE IMAGE** is the file-picker
+fallback for browsers that do not expose image clipboard data. Images are
+limited to 8 MiB and are not written to the repository.
+
 The full media and input smoke test requires a running gateway and Forge
 session:
 
@@ -145,7 +152,9 @@ WebSocket upstream requests.
 | `EUTHERGATE_DESKTOP_OUTPUT` | `EUTHERGATE-1` | Name of the headless Hyprland output. |
 | `EUTHERGATE_DESKTOP_MODE` | `1280x720@30` | Virtual output resolution and frame rate. |
 | `EUTHERGATE_DESKTOP_HELPER` | `scripts/webrtc_desktop.py` | GStreamer media helper. |
+| `EUTHERGATE_WAYVNC_BIN` | discovered from `PATH` | Optional WayVNC executable for authenticated VNC/WSS. |
 | `EUTHERGATE_FORGE_SESSION_FILE` | `$XDG_RUNTIME_DIR/euthergate-forge/session.env` | Runtime descriptor for the persistent Forge compositor. |
+| `EUTHERGATE_TERMINAL_UPLOAD_DIR` | `/tmp/euthergate-<uid>/terminal-images` | Private directory for images pasted into Gate Shell. |
 | `EUTHERGATE_SECURE_COOKIE` | `false` | Add `Secure` to the auth cookie. Enable behind HTTPS. |
 | `EUTHERGATE_PROXY_TOKEN` | unset | Shared secret accepted only from the EutherOxide admin proxy. |
 | `EUTHERGATE_TURN_URLS` | unset | Comma-separated TURN/TURNS relay URLs for restrictive remote networks. |
@@ -157,6 +166,28 @@ transport, TURN endpoint errors and the selected route. Credentials and
 candidate IP addresses are intentionally omitted. Prefer a dedicated,
 DNS-only first-party hostname such as `turn.apothictech.se` for TURN/TLS; see
 [docs/turn-relay.md](docs/turn-relay.md) for the staged migration checks.
+
+The desktop menu also has a protocol picker. `AUTO` keeps direct WebRTC and all
+configured relays available. The other choices constrain a new connection to a
+single route such as relay-only TURN/TLS on TCP 443 or TURN/UDP on 443. Changing
+the choice reconnects only the desktop viewer and stores the preference in that
+browser. It does not change the setting for phones or other computers. Record
+network-specific results in
+[docs/network-transport-test-log.md](docs/network-transport-test-log.md).
+
+`WORK · HTTPS/WSS` is the compatibility route for networks that allow the web
+application but block every WebRTC/TURN candidate. It sends JPEG frames and
+input through one authenticated WebSocket on the same HTTPS origin. This costs
+more bandwidth and latency than VP8/WebRTC, so `AUTO` remains the default.
+
+`WORK · VNC/WSS` appears when WayVNC is installed. The embedded noVNC client
+speaks RFB over an authenticated same-origin WebSocket. EutherGate starts one
+WayVNC child per viewer on a private Unix socket and stops it when the viewer
+disconnects; no VNC TCP port is exposed. This route can use changed-region RFB
+encodings and native Wayland input, making it the first performance alternative
+to the full-frame JPEG fallback on HTTPS-only networks. While a VNC viewer is
+connected, EutherGate wakes the selected output and holds an idle inhibitor so
+Hyprland or Sway cannot pause capture by powering that output off.
 
 Never expose this checkpoint directly to the public internet. Put it behind TLS
 and a trusted access layer. A VPN such as Tailscale is currently the simplest

@@ -72,6 +72,38 @@ to authenticated clients. The web UI reports gathered candidates, sanitized
 TURN endpoints, ICE errors and the selected route. It never displays TURN
 usernames, credentials or candidate IP addresses.
 
+## Protocol picker
+
+The authenticated desktop menu builds its choices from transport profiles
+returned by the server. Profiles only appear when their matching TURN URL is
+configured. The choices are:
+
+- `AUTO`: direct WebRTC plus every configured relay;
+- `DIRECT / LAN`: direct WebRTC without a TURN server;
+- `WORK · HTTPS/WSS`: JPEG frames and input over the authenticated web path;
+- `WORK · VNC/WSS`: WayVNC/RFB over an authenticated same-origin WebSocket;
+- `WORK · TURN/TLS 443`: relay-only TLS over TCP 443;
+- `TURN/UDP 443`: relay-only UDP over port 443;
+- `TURN/TCP 3478`: relay-only TCP over the standard TURN port;
+- `TURN/UDP 3478`: relay-only UDP over the standard TURN port.
+
+Changing the profile closes the current viewer and starts the selected WebRTC
+or WSS transport. It does not restart the remote compositor or gateway. The
+selected profile is saved in browser local storage, so a work computer can
+retain a different choice from a phone or home computer. The TURN choices are
+ordinary advertised TURN transports; none is presented as HTTP or disguised as
+another protocol.
+
+The HTTPS/WSS profile is the explicit exception to the WebRTC routes. It uses
+`/ws/desktop-fallback` on the already authenticated application origin, sends
+binary JPEG frames at up to 12 fps, and returns the normal pointer/keyboard JSON
+events over the same socket. It is a compatibility path for restrictive
+networks, not an attempt to label TURN as HTTP. The shared one-viewer limit also
+applies across WebRTC and WSS viewers.
+
+Use [network-transport-test-log.md](network-transport-test-log.md) to record
+which profile works on each network.
+
 ## Rotation and rollback
 
 To rotate the shared secret, create a new `.env.turn`, copy it to the relay,
