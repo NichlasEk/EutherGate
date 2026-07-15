@@ -133,6 +133,12 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   font: 9px "Space Mono", monospace; letter-spacing: .1em; text-shadow: 0 1px 3px #000;
 }
 .desktop-footer { display: flex; justify-content: space-between; gap: 20px; color: #626b66; font: 10px "Space Mono", monospace; }
+.desktop-network {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; align-items: start;
+  color: #68736d; font: 9px/1.5 "Space Mono", monospace; letter-spacing: .03em;
+}
+.desktop-network span:last-child { overflow-wrap: anywhere; text-align: right; }
+.desktop-network .error { color: #d78b72; }
 
 @media (max-width: 620px) {
   .topbar { height: 62px; padding: 0 18px; }
@@ -153,6 +159,8 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   .clipboard-actions { grid-template-columns: 1fr; }
   .desktop-frame { min-height: 300px; }
   .desktop-footer span:first-child { display: none; }
+  .desktop-network { grid-template-columns: 1fr; gap: 3px; }
+  .desktop-network span:last-child { text-align: left; }
   .output-picker { max-width: 145px; }
   #desktop-terminal { display: none; }
 }

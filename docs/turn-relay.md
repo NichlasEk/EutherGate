@@ -16,7 +16,8 @@ long-lived shared secret is never included in the web bundle or repository.
   allocations cannot be used to reach other LAN or internet destinations.
 - Caddy keeps TCP `443`; HTTP/3 is disabled to reserve UDP `443` for TURN.
 - `play.apothictech.se` is Cloudflare-proxied and must not be used as a TURN
-  address. Clients currently use the public IP directly.
+  address. The current UDP routes use the public IP directly, while the TCP/TLS
+  route uses a temporary `sslip.io` hostname for certificate name matching.
 
 The ZTE router mappings are created with `upnpc` running on `192.168.32.186`;
 the router rejects attempts from another LAN client to map ports to the relay.
@@ -29,11 +30,34 @@ The private local file `.env.turn` is ignored by Git and loaded by
 `/etc/coturn/euthergate-turn.env` on the relay host. Both contain the same
 `EUTHERGATE_TURN_SHARED_SECRET`; do not print or commit it.
 
-To create the initial file:
+To create the initial file without printing the secret:
 
 ```bash
-./scripts/configure-turn-client.sh 90.235.24.7
+./scripts/configure-turn-client.sh <public-turn-host-or-ip>
 ```
+
+## First-party TURN hostname
+
+`turn.apothictech.se` is the intended replacement for the temporary `sslip.io`
+name. It must be a DNS-only A record pointing directly to `90.235.24.7`; a
+normal Cloudflare HTTP proxy does not carry TURN. Do not activate the hostname
+until all of these checks pass:
+
+```bash
+getent ahosts turn.apothictech.se
+openssl s_client -connect turn.apothictech.se:443 -servername turn.apothictech.se -brief </dev/null
+```
+
+The TLS certificate must name `turn.apothictech.se`, and the TCP/TLS frontend
+must still forward TURN connections to coturn. Once that is true, preserve the
+existing shared secret and replace only the client hostname:
+
+```bash
+./scripts/configure-turn-client.sh --replace-host turn.apothictech.se
+```
+
+Restarting `euthergate.service` is deliberately a separate step because it
+terminates every terminal and desktop connection hosted by the gateway.
 
 ## Services and verification
 
@@ -44,8 +68,9 @@ journalctl -u euthergate-turn-3478.service -u euthergate-turn-443-udp.service
 ```
 
 EutherGate `/api/desktop/status` should return a non-empty `ice_servers` array
-to authenticated clients. The web UI reports actual WebRTC and ICE states if
-video has not started after eight seconds.
+to authenticated clients. The web UI reports gathered candidates, sanitized
+TURN endpoints, ICE errors and the selected route. It never displays TURN
+usernames, credentials or candidate IP addresses.
 
 ## Rotation and rollback
 

@@ -152,6 +152,12 @@ WebSocket upstream requests.
 | `EUTHERGATE_TURN_SHARED_SECRET` | unset | Coturn REST shared secret used to mint one-hour client credentials. |
 | `RUST_LOG` | `euthergate=info,tower_http=info` | Log filter. |
 
+The desktop footer includes sanitized ICE diagnostics: candidate types,
+transport, TURN endpoint errors and the selected route. Credentials and
+candidate IP addresses are intentionally omitted. Prefer a dedicated,
+DNS-only first-party hostname such as `turn.apothictech.se` for TURN/TLS; see
+[docs/turn-relay.md](docs/turn-relay.md) for the staged migration checks.
+
 Never expose this checkpoint directly to the public internet. Put it behind TLS
 and a trusted access layer. A VPN such as Tailscale is currently the simplest
 remote path when TURN is unavailable. Configure the TURN settings above for

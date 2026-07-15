@@ -39,6 +39,16 @@ type DisplayWakeResult = {
   hold_seconds: number;
 };
 
+type ExtendedIceCandidate = RTCIceCandidate & {
+  relayProtocol?: string;
+  url?: string;
+};
+
+type IceCandidatePairStats = RTCStats & {
+  localCandidateId: string;
+  remoteCandidateId: string;
+};
+
 const appNode = document.querySelector<HTMLDivElement>("#app");
 if (!appNode) throw new Error("Missing #app");
 const app: HTMLDivElement = appNode;
@@ -55,6 +65,9 @@ let desktopIceServers: RTCIceServer[] = [];
 let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
 let desktopControlActive = false;
+let desktopIceCandidates: string[] = [];
+let desktopIceErrors: string[] = [];
+let desktopSelectedRoute = "none";
 let proxiedSession = false;
 let clipboardPreviewUrl: string | null = null;
 let remoteClipboardBlob: Blob | null = null;
@@ -220,6 +233,10 @@ async function renderDesktop(): Promise<void> {
       <div class="desktop-footer">
         <span>Click to enter remote control · Esc returns to the local desktop.</span>
         <span id="desktop-mode">1280×720 @ 30</span>
+      </div>
+      <div class="desktop-network" aria-live="polite">
+        <span id="desktop-ice-route">ICE ROUTE · waiting</span>
+        <span id="desktop-ice-detail">TURN · probing</span>
       </div>
     </section>`);
 
@@ -554,6 +571,7 @@ function connectDesktop(): void {
   socket = new WebSocket(gateWebSocket("ws/desktop"));
   remoteCandidates = [];
   desktopVideoReady = false;
+  resetIceDiagnostics();
   setDesktopState("NEGOTIATING");
 
   peer = new RTCPeerConnection({ bundlePolicy: "max-bundle", iceServers: desktopIceServers });
@@ -574,15 +592,32 @@ function connectDesktop(): void {
     });
   });
   peer.addEventListener("icecandidate", (event) => {
+    if (event.candidate) {
+      const summary = describeIceCandidate(event.candidate);
+      if (!desktopIceCandidates.includes(summary)) desktopIceCandidates.push(summary);
+      updateIceDiagnostics();
+    }
     if (event.candidate && socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "ice", ...event.candidate.toJSON() }));
     }
   });
+  peer.addEventListener("icecandidateerror", (event) => {
+    const failure = event as RTCPeerConnectionIceErrorEvent;
+    const server = describeIceUrl(failure.url);
+    const detail = `${server} · ${failure.errorCode} ${failure.errorText}`.trim();
+    if (!desktopIceErrors.includes(detail)) desktopIceErrors.push(detail);
+    updateIceDiagnostics();
+  });
+  peer.addEventListener("icegatheringstatechange", updateIceDiagnostics);
   peer.addEventListener("connectionstatechange", () => {
     if (peer?.connectionState === "connected") {
       setDesktopState(desktopVideoReady ? (inputChannel?.readyState === "open" ? "LIVE" : "VIDEO") : "WAITING FOR VIDEO");
+      void updateSelectedIceRoute();
     }
-    if (["failed", "disconnected", "closed"].includes(peer?.connectionState || "")) setDesktopState("RECONNECTING");
+    if (["failed", "disconnected", "closed"].includes(peer?.connectionState || "")) {
+      setDesktopState("RECONNECTING");
+      void updateSelectedIceRoute();
+    }
   });
   peer.addEventListener("iceconnectionstatechange", () => {
     if (!peer || desktopVideoReady) return;
@@ -598,6 +633,7 @@ function connectDesktop(): void {
       if (!desktopVideoReady) {
         const rtcState = peer?.connectionState || "unknown";
         const iceState = peer?.iceConnectionState || "unknown";
+        void updateSelectedIceRoute();
         setDesktopState("NO VIDEO");
         showDesktopMessage(`No video frames yet (WebRTC ${rtcState}, ICE ${iceState}).`);
       }
@@ -628,12 +664,95 @@ function connectDesktop(): void {
   });
 }
 
+function resetIceDiagnostics(): void {
+  desktopIceCandidates = [];
+  desktopIceErrors = [];
+  desktopSelectedRoute = "none";
+  updateIceDiagnostics();
+}
+
+function iceServerUrls(): string[] {
+  return desktopIceServers.flatMap((server) => typeof server.urls === "string" ? [server.urls] : server.urls);
+}
+
+function describeIceUrl(url: string): string {
+  if (!url) return "unknown ICE server";
+  const match = url.match(/^(turns?):(?:[^@]+@)?([^?]+)(?:\?transport=([^&]+))?/i);
+  if (!match) return "ICE server";
+  const transport = match[3] ? `/${match[3].toLowerCase()}` : "";
+  return `${match[1].toLowerCase()}:${match[2]}${transport}`;
+}
+
+function describeIceCandidate(candidate: RTCIceCandidate): string {
+  const extended = candidate as ExtendedIceCandidate;
+  const type = candidate.type || "unknown";
+  const protocol = candidate.protocol || "unknown";
+  const relayProtocol = extended.relayProtocol ? `/${extended.relayProtocol}` : "";
+  const server = extended.url ? ` via ${describeIceUrl(extended.url)}` : "";
+  return `${type}/${protocol}${relayProtocol}${server}`;
+}
+
+function updateIceDiagnostics(): void {
+  const route = document.querySelector<HTMLElement>("#desktop-ice-route");
+  const detail = document.querySelector<HTMLElement>("#desktop-ice-detail");
+  const gathering = peer?.iceGatheringState || "new";
+  if (route) route.textContent = `ICE ROUTE · ${desktopSelectedRoute} · gathering ${gathering}`;
+  if (!detail) return;
+  if (desktopIceErrors.length) {
+    detail.textContent = `TURN ERROR · ${desktopIceErrors.join(" | ")}`;
+    detail.classList.add("error");
+    return;
+  }
+  detail.classList.remove("error");
+  const candidates = desktopIceCandidates.length ? desktopIceCandidates.join(" | ") : "no candidates yet";
+  const servers = iceServerUrls().map(describeIceUrl).join(" | ") || "not configured";
+  detail.textContent = `CANDIDATES · ${candidates} · SERVERS · ${servers}`;
+}
+
+async function updateSelectedIceRoute(): Promise<void> {
+  const activePeer = peer;
+  if (!activePeer) return;
+  try {
+    const report = await activePeer.getStats();
+    if (peer !== activePeer) return;
+    let selectedPair: IceCandidatePairStats | undefined;
+    report.forEach((entry) => {
+      if (entry.type === "transport" && entry.selectedCandidatePairId) {
+        selectedPair = report.get(entry.selectedCandidatePairId) as IceCandidatePairStats | undefined;
+      }
+    });
+    if (!selectedPair) {
+      report.forEach((entry) => {
+        if (entry.type === "candidate-pair" && entry.state === "succeeded" && (entry.nominated || entry.selected)) {
+          selectedPair = entry as IceCandidatePairStats;
+        }
+      });
+    }
+    if (!selectedPair) {
+      desktopSelectedRoute = activePeer.connectionState;
+      updateIceDiagnostics();
+      return;
+    }
+    const local = report.get(selectedPair.localCandidateId);
+    const remote = report.get(selectedPair.remoteCandidateId);
+    const localType = local?.candidateType || "unknown";
+    const localProtocol = local?.protocol || "unknown";
+    const relayProtocol = local?.relayProtocol ? `/${local.relayProtocol}` : "";
+    const remoteType = remote?.candidateType || "unknown";
+    desktopSelectedRoute = `${localType}/${localProtocol}${relayProtocol} → ${remoteType}`;
+  } catch (error) {
+    desktopSelectedRoute = `stats unavailable: ${error instanceof Error ? error.message : "unknown error"}`;
+  }
+  updateIceDiagnostics();
+}
+
 function markDesktopVideoReady(): void {
   desktopVideoReady = true;
   if (desktopNegotiationTimer !== null) window.clearTimeout(desktopNegotiationTimer);
   desktopNegotiationTimer = null;
   hideDesktopMessage();
   setDesktopState(inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
+  void updateSelectedIceRoute();
 }
 
 function installDesktopInput(): void {
