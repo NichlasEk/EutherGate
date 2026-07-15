@@ -40,7 +40,7 @@ fi
 
 desktop_ready=true
 desktop_notes=()
-for command in hyprctl grim gst-inspect-1.0; do
+for command in hyprctl grim wl-copy wl-paste gst-inspect-1.0; do
     if ! command -v "$command" >/dev/null 2>&1; then
         desktop_ready=false
         desktop_notes+=("missing $command")

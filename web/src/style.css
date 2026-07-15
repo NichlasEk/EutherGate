@@ -20,7 +20,7 @@ body {
   background-size: auto, 42px 42px, 42px 42px, auto;
 }
 
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 button { cursor: pointer; }
 .gate-shell { min-height: 100vh; display: flex; flex-direction: column; }
 .topbar {
@@ -79,7 +79,37 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 #terminal { height: calc(100% - 39px); padding: 12px; }
 .hint { color: #626b66; font: 10px "Space Mono", monospace; }
 
-.desktop-workspace { height: calc(100vh - 72px); }
+.desktop-workspace { position: relative; height: calc(100vh - 72px); }
+.clipboard-panel {
+  position: absolute; z-index: 10; top: 112px; right: 18px; width: min(430px, calc(100% - 36px));
+  max-height: calc(100% - 155px); overflow: auto; padding: 22px; border: 1px solid #4b5838;
+  background: rgba(10, 14, 17, .97); box-shadow: 0 24px 80px rgba(0,0,0,.65);
+  backdrop-filter: blur(18px);
+}
+.clipboard-panel[hidden] { display: none; }
+.clipboard-heading { display: flex; justify-content: space-between; align-items: start; gap: 18px; }
+.clipboard-heading h2 { margin: 7px 0 0; color: #edf2ee; font-size: 27px; letter-spacing: -.04em; }
+.clipboard-status { min-height: 38px; margin: 18px 0 12px; color: #929d96; font: 10px/1.7 "Space Mono", monospace; }
+.clipboard-status.error { color: #d8a080; }
+.clipboard-preview {
+  min-height: 145px; display: grid; place-items: center; overflow: hidden; padding: 10px;
+  border: 1px solid #282f30; background: #06080a; color: #59635e;
+  font: 10px "Space Mono", monospace; text-align: center;
+}
+.clipboard-preview textarea {
+  width: 100%; min-height: 140px; max-height: 260px; resize: vertical; padding: 11px; border: 0;
+  outline: 0; color: #dbe2dd; background: #090c0f; font: 12px/1.55 "Space Mono", monospace;
+  text-align: left;
+}
+.clipboard-preview img { display: block; max-width: 100%; max-height: 280px; object-fit: contain; }
+.clipboard-preview textarea[hidden], .clipboard-preview img[hidden], .clipboard-preview span[hidden] { display: none; }
+.clipboard-paste-zone {
+  margin-top: 10px; padding: 12px; border: 1px dashed #39413e; outline: 0; color: #68736d;
+  font: 9px/1.5 "Space Mono", monospace; text-align: center;
+}
+.clipboard-paste-zone:focus { color: var(--acid); border-color: var(--acid); background: rgba(199,255,74,.04); }
+.clipboard-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.clipboard-actions button { min-height: 42px; }
 .desktop-frame {
   position: relative; flex: 1; min-height: 360px; overflow: hidden; outline: none;
   border: 1px solid #2b3233; background: #050608;
@@ -117,6 +147,8 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   .terminal-frame { min-height: 520px; }
   #terminal { padding: 7px 3px; }
   .desktop-workspace { height: calc(100vh - 62px); }
+  .clipboard-panel { top: 88px; right: 0; width: 100%; max-height: calc(100% - 105px); padding: 17px; }
+  .clipboard-actions { grid-template-columns: 1fr; }
   .desktop-frame { min-height: 300px; }
   .desktop-footer span:first-child { display: none; }
   .output-picker { max-width: 145px; }

@@ -13,18 +13,19 @@ The first two checkpoints form a usable vertical slice:
 - a persistent pre-login Forge desktop plus selectable logged-in Hyprland outputs;
 - VP8 desktop video transported with WebRTC;
 - pointer, keyboard and wheel events over a WebRTC DataChannel;
+- text and image clipboard transfer between the selected Wayland session and browser;
 - a browser switcher between Gate Shell and Remote Forge.
 
 ## Run it
 
 Requirements: Rust, Node.js and npm.
 
-Remote Forge additionally needs Sway, `wtype`, `grim`, Python with PyGObject and
+Remote Forge additionally needs Sway, `wtype`, `grim`, `wl-clipboard`, Python with PyGObject and
 `websockets`, and the GStreamer WebRTC and VP8 plugins. A logged-in Hyprland
 session is optional and appears automatically as another set of outputs.
 On Arch Linux these are supplied by `gstreamer`, `gst-plugins-bad`,
 `gst-plugins-good`, `gst-libav`, `gst-python`, `python-websockets`, `sway`,
-`wtype` and `grim`.
+`wtype`, `grim` and `wl-clipboard`.
 
 The easy path checks the environment, creates a private token on first run,
 builds the web UI and starts the gateway:
@@ -62,6 +63,12 @@ workspace. The equivalent command from Gate Shell is, for example:
 ```bash
 hyprctl dispatch exec '[workspace 3 silent] kitty'
 ```
+
+Use **CLIPBOARD** to move plain text, PNG, JPEG or WebP images in either
+direction. **REMOTE → HERE** copies the selected Wayland session's current
+clipboard to the browser computer. **HERE → REMOTE** reads the local browser
+clipboard; when a browser blocks direct reads, focus the displayed paste box
+and press Ctrl+V. Payloads are authenticated, never logged and limited to 8 MiB.
 
 The workspace number is shown in the lower-left WebRTC HUD and may differ from
 `3` depending on the current compositor state.

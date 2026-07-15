@@ -48,6 +48,10 @@ let desktopVideoReady = false;
 let desktopNegotiationTimer: number | null = null;
 let desktopControlActive = false;
 let proxiedSession = false;
+let clipboardPreviewUrl: string | null = null;
+let remoteClipboardBlob: Blob | null = null;
+
+const clipboardLimit = 8 * 1024 * 1024;
 
 const gateRoot = new URL("./", document.baseURI);
 
@@ -166,10 +170,30 @@ async function renderDesktop(): Promise<void> {
           <span id="desktop-state" class="socket-state">PROBING</span>
           <select id="desktop-output-picker" class="output-picker" aria-label="Wayland output" disabled></select>
           <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
+          <button id="desktop-clipboard" class="ghost-button" type="button" disabled>CLIPBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
           <button id="desktop-power" class="ghost-button primary-action" type="button" disabled>START DESKTOP</button>
         </div>
       </div>
+      <aside id="clipboard-panel" class="clipboard-panel" aria-label="Clipboard bridge" hidden>
+        <div class="clipboard-heading">
+          <div><span class="eyebrow">WAYLAND / LOCAL BRIDGE</span><h2>Clipboard</h2></div>
+          <button id="clipboard-close" class="ghost-button" type="button">CLOSE</button>
+        </div>
+        <p id="clipboard-status" class="clipboard-status">Choose a direction. Clipboard contents never leave this authenticated session.</p>
+        <div id="clipboard-preview" class="clipboard-preview">
+          <span>Remote clipboard preview appears here.</span>
+          <textarea id="clipboard-text" readonly hidden aria-label="Remote clipboard text"></textarea>
+          <img id="clipboard-image" alt="Remote clipboard image" hidden />
+        </div>
+        <div id="clipboard-paste-zone" class="clipboard-paste-zone" tabindex="0">
+          If browser access is blocked, click here and press Ctrl+V.
+        </div>
+        <div class="clipboard-actions">
+          <button id="clipboard-from-remote" class="ghost-button primary-action" type="button">REMOTE → HERE</button>
+          <button id="clipboard-to-remote" class="ghost-button primary-action" type="button">HERE → REMOTE</button>
+        </div>
+      </aside>
       <div class="desktop-frame" id="desktop-frame" tabindex="0">
         <video id="desktop-video" autoplay playsinline muted></video>
         <div class="desktop-empty" id="desktop-empty">
@@ -191,7 +215,9 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-power")?.addEventListener("click", toggleDesktop);
   document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
+  document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
+  installClipboardBridge();
   installDesktopInput();
 
   try {
@@ -230,6 +256,8 @@ function updateDesktopStatus(status: DesktopStatus): void {
   }
   const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
   if (terminalButton) terminalButton.disabled = !status.active;
+  const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
+  if (clipboardButton) clipboardButton.disabled = !status.active;
   setDesktopState(status.active ? "NEGOTIATING" : "OFFLINE");
 }
 
@@ -249,11 +277,17 @@ async function toggleDesktop(): Promise<void> {
     button.textContent = active ? "START DESKTOP" : "STOP DESKTOP";
     if (active) {
       disposeDesktop();
+      const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
+      if (terminalButton) terminalButton.disabled = true;
+      const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
+      if (clipboardButton) clipboardButton.disabled = true;
       setDesktopState("OFFLINE");
       showDesktopMessage("Virtual Wayland output offline");
     } else {
       const terminalButton = document.querySelector<HTMLButtonElement>("#desktop-terminal");
       if (terminalButton) terminalButton.disabled = false;
+      const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
+      if (clipboardButton) clipboardButton.disabled = false;
       connectDesktop();
     }
   } catch (error) {
@@ -300,6 +334,205 @@ async function launchDesktopTerminal(): Promise<void> {
     showDesktopMessage(error instanceof Error ? error.message : "Could not launch terminal.");
   } finally {
     if (button) button.disabled = false;
+  }
+}
+
+function installClipboardBridge(): void {
+  document.querySelector<HTMLButtonElement>("#clipboard-close")?.addEventListener("click", closeClipboardPanel);
+  document.querySelector<HTMLButtonElement>("#clipboard-from-remote")?.addEventListener("click", copyRemoteClipboardToLocal);
+  document.querySelector<HTMLButtonElement>("#clipboard-to-remote")?.addEventListener("click", sendLocalClipboardToRemote);
+  document.querySelector<HTMLDivElement>("#clipboard-paste-zone")?.addEventListener("paste", pasteClipboardToRemote);
+}
+
+function openClipboardPanel(): void {
+  releaseDesktopControl();
+  const panel = document.querySelector<HTMLElement>("#clipboard-panel");
+  if (!panel) return;
+  panel.hidden = false;
+  void refreshRemoteClipboardPreview();
+}
+
+function closeClipboardPanel(): void {
+  const panel = document.querySelector<HTMLElement>("#clipboard-panel");
+  if (panel) panel.hidden = true;
+}
+
+async function refreshRemoteClipboardPreview(): Promise<void> {
+  setClipboardStatus("Reading the selected Wayland clipboard…");
+  remoteClipboardBlob = null;
+  try {
+    const response = await fetch(gateUrl("api/desktop/clipboard"), { cache: "no-store" });
+    if (response.status === 204) {
+      clearClipboardPreview();
+      setClipboardStatus("The remote clipboard is empty or has no supported text/image format.");
+      return;
+    }
+    if (!response.ok) throw new Error(await responseError(response, "Could not read remote clipboard."));
+    const blob = await response.blob();
+    if (blob.size > clipboardLimit) throw new Error("Remote clipboard exceeds the 8 MiB limit.");
+    remoteClipboardBlob = blob;
+    await showClipboardPreview(blob);
+    setClipboardStatus(`${clipboardDescription(blob)} ready. Press REMOTE → HERE to copy it.`);
+  } catch (error) {
+    clearClipboardPreview();
+    setClipboardStatus(error instanceof Error ? error.message : "Could not read remote clipboard.", true);
+  }
+}
+
+async function copyRemoteClipboardToLocal(): Promise<void> {
+  const blob = remoteClipboardBlob;
+  if (!blob) {
+    setClipboardStatus("No remote clipboard value is loaded. Close and reopen the panel to refresh.", true);
+    return;
+  }
+  try {
+    if (blob.type.startsWith("text/plain")) {
+      const text = await blob.text();
+      await navigator.clipboard.writeText(text);
+    } else if (navigator.clipboard.write && typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    } else {
+      throw new Error("This browser cannot write images directly to the clipboard.");
+    }
+    setClipboardStatus(`${clipboardDescription(blob)} copied to this computer.`);
+  } catch (error) {
+    const text = document.querySelector<HTMLTextAreaElement>("#clipboard-text");
+    if (text && !text.hidden) {
+      text.focus();
+      text.select();
+      setClipboardStatus("Browser copy was blocked. The text is selected—press Ctrl+C.", true);
+    } else {
+      setClipboardStatus("Browser image copy was blocked. Right-click the preview and choose Copy Image.", true);
+    }
+  }
+}
+
+async function sendLocalClipboardToRemote(): Promise<void> {
+  try {
+    if (!navigator.clipboard.read) throw new Error("Clipboard item reading is unavailable.");
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const imageType = ["image/png", "image/jpeg", "image/webp"].find((type) => item.types.includes(type));
+      if (imageType) {
+        await uploadClipboard(await item.getType(imageType));
+        return;
+      }
+    }
+    for (const item of items) {
+      if (item.types.includes("text/plain")) {
+        await uploadClipboard(await item.getType("text/plain"));
+        return;
+      }
+    }
+    throw new Error("Local clipboard has no supported text or image.");
+  } catch {
+    const zone = document.querySelector<HTMLDivElement>("#clipboard-paste-zone");
+    zone?.focus();
+    setClipboardStatus("Direct access was blocked. Press Ctrl+V in the highlighted box.", true);
+  }
+}
+
+function pasteClipboardToRemote(event: ClipboardEvent): void {
+  event.preventDefault();
+  const clipboard = event.clipboardData;
+  if (!clipboard) return;
+  const image = Array.from(clipboard.items)
+    .find((item) => ["image/png", "image/jpeg", "image/webp"].includes(item.type))
+    ?.getAsFile();
+  if (image) {
+    void uploadClipboard(image);
+    return;
+  }
+  const text = clipboard.getData("text/plain");
+  if (text) {
+    void uploadClipboard(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    return;
+  }
+  setClipboardStatus("The pasted value has no supported text or image.", true);
+}
+
+async function uploadClipboard(blob: Blob): Promise<void> {
+  if (!blob.size) {
+    setClipboardStatus("The local clipboard is empty.", true);
+    return;
+  }
+  if (blob.size > clipboardLimit) {
+    setClipboardStatus("Clipboard payload exceeds the 8 MiB limit.", true);
+    return;
+  }
+  const mime = blob.type.split(";", 1)[0].toLowerCase();
+  if (!["text/plain", "image/png", "image/jpeg", "image/webp"].includes(mime)) {
+    setClipboardStatus(`Unsupported clipboard type: ${mime || "unknown"}.`, true);
+    return;
+  }
+  setClipboardStatus(`Sending ${clipboardDescription(blob)} to the selected Wayland session…`);
+  try {
+    const response = await fetch(gateUrl("api/desktop/clipboard"), {
+      method: "POST",
+      headers: { "content-type": blob.type || mime },
+      body: blob,
+    });
+    if (!response.ok) throw new Error(await responseError(response, "Could not update remote clipboard."));
+    remoteClipboardBlob = blob;
+    await showClipboardPreview(blob);
+    setClipboardStatus(`${clipboardDescription(blob)} is now on the remote clipboard.`);
+  } catch (error) {
+    setClipboardStatus(error instanceof Error ? error.message : "Could not update remote clipboard.", true);
+  }
+}
+
+async function showClipboardPreview(blob: Blob): Promise<void> {
+  clearClipboardPreview();
+  const placeholder = document.querySelector<HTMLSpanElement>("#clipboard-preview > span");
+  const text = document.querySelector<HTMLTextAreaElement>("#clipboard-text");
+  const image = document.querySelector<HTMLImageElement>("#clipboard-image");
+  if (placeholder) placeholder.hidden = true;
+  if (blob.type.startsWith("text/plain") && text) {
+    text.value = await blob.text();
+    text.hidden = false;
+  } else if (image) {
+    clipboardPreviewUrl = URL.createObjectURL(blob);
+    image.src = clipboardPreviewUrl;
+    image.hidden = false;
+  }
+}
+
+function clearClipboardPreview(): void {
+  if (clipboardPreviewUrl) URL.revokeObjectURL(clipboardPreviewUrl);
+  clipboardPreviewUrl = null;
+  const placeholder = document.querySelector<HTMLSpanElement>("#clipboard-preview > span");
+  const text = document.querySelector<HTMLTextAreaElement>("#clipboard-text");
+  const image = document.querySelector<HTMLImageElement>("#clipboard-image");
+  if (placeholder) placeholder.hidden = false;
+  if (text) {
+    text.value = "";
+    text.hidden = true;
+  }
+  if (image) {
+    image.removeAttribute("src");
+    image.hidden = true;
+  }
+}
+
+function clipboardDescription(blob: Blob): string {
+  const kind = blob.type.startsWith("text/plain") ? "Text" : "Image";
+  const size = blob.size < 1024 ? `${blob.size} B` : `${(blob.size / 1024).toFixed(blob.size < 1024 * 1024 ? 1 : 0)} KiB`;
+  return `${kind} (${size})`;
+}
+
+function setClipboardStatus(message: string, error = false): void {
+  const status = document.querySelector<HTMLParagraphElement>("#clipboard-status");
+  if (!status) return;
+  status.textContent = message;
+  status.classList.toggle("error", error);
+}
+
+async function responseError(response: Response, fallback: string): Promise<string> {
+  try {
+    const body = (await response.json()) as { error?: string };
+    return body.error || fallback;
+  } catch {
+    return fallback;
   }
 }
 
@@ -616,6 +849,9 @@ function disposeTerminal(): void {
 
 function disposeDesktop(): void {
   releaseDesktopControl();
+  closeClipboardPanel();
+  clearClipboardPreview();
+  remoteClipboardBlob = null;
   window.removeEventListener("keydown", desktopKeyEvent, { capture: true });
   window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
   document.removeEventListener("pointerlockchange", desktopPointerLockChange);

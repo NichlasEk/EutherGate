@@ -5,10 +5,10 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 cd "$ROOT_DIR"
 
-for command in sway swaymsg wtype grim; do
+for command in sway swaymsg wtype grim wl-copy wl-paste; do
     if ! command -v "$command" >/dev/null; then
         echo "Missing required Forge command: $command" >&2
-        echo "On Arch Linux: sudo pacman -S sway wtype grim" >&2
+        echo "On Arch Linux: sudo pacman -S sway wtype grim wl-clipboard" >&2
         exit 1
     fi
 done
@@ -37,7 +37,11 @@ install -m 644 "$ROOT_DIR/deploy/systemd/euthergate.service" "$UNIT_DIR/eutherga
 install -m 644 "$ROOT_DIR/deploy/systemd/euthergate-tunnel.service" "$UNIT_DIR/euthergate-tunnel.service"
 install -m 644 "$ROOT_DIR/deploy/systemd/euthergate-forge.service" "$UNIT_DIR/euthergate-forge.service"
 systemctl --user daemon-reload
-systemctl --user enable euthergate-forge.service euthergate.service euthergate-tunnel.service
+for unit in euthergate-forge.service euthergate.service euthergate-tunnel.service; do
+    if ! systemctl --user is-enabled --quiet "$unit"; then
+        systemctl --user enable "$unit"
+    fi
+done
 
 # Pick up updated binaries, scripts, and unit files even when an older version
 # of the services was already active before this installation.

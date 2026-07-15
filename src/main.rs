@@ -13,8 +13,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
-        Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -28,9 +29,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::{Mutex, broadcast},
+    time::{Duration, timeout},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -42,6 +44,8 @@ use tracing_subscriber::EnvFilter;
 const AUTH_COOKIE: &str = "euthergate_session";
 const PROXY_AUTH_HEADER: &str = "x-euthergate-proxy-token";
 const HISTORY_LIMIT: usize = 256 * 1024;
+const CLIPBOARD_LIMIT: usize = 8 * 1024 * 1024;
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone)]
 struct AppState {
@@ -190,6 +194,11 @@ struct ForgeSession {
     output: String,
 }
 
+struct ClipboardPayload {
+    mime: String,
+    data: Vec<u8>,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
@@ -246,6 +255,12 @@ async fn main() -> Result<()> {
         .route(
             "/api/desktop/launch-terminal",
             post(desktop_launch_terminal),
+        )
+        .route(
+            "/api/desktop/clipboard",
+            get(desktop_clipboard_read)
+                .post(desktop_clipboard_write)
+                .layer(DefaultBodyLimit::max(CLIPBOARD_LIMIT)),
         )
         .route("/ws/terminal", get(terminal_ws))
         .route("/ws/desktop", get(desktop_ws))
@@ -630,6 +645,80 @@ async fn desktop_launch_terminal(State(state): State<AppState>, headers: HeaderM
     }
 }
 
+async fn desktop_clipboard_read(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.desktop.read_clipboard().await {
+        Ok(Some(payload)) => {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&payload.mime).expect("supported clipboard MIME type"),
+            );
+            response_headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, max-age=0"),
+            );
+            (response_headers, payload.data).into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            warn!(%error, "could not read Wayland clipboard");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn desktop_clipboard_write(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(supported_upload_mime)
+    else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(
+                serde_json::json!({ "error": "clipboard supports plain text, PNG, JPEG and WebP" }),
+            ),
+        )
+            .into_response();
+    };
+    if body.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "clipboard payload is empty" })),
+        )
+            .into_response();
+    }
+    match state
+        .desktop
+        .write_clipboard(content_type, body.as_ref())
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            warn!(%error, "could not write Wayland clipboard");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn desktop_stop(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -814,6 +903,101 @@ impl DesktopManager {
         }
     }
 
+    async fn read_clipboard(&self) -> Result<Option<ClipboardPayload>> {
+        let selection = self.clipboard_selection()?;
+        let mut list_command = clipboard_command(&selection, "wl-paste")?;
+        let listed = timeout(
+            CLIPBOARD_TIMEOUT,
+            list_command.args(["--list-types"]).output(),
+        )
+        .await
+        .context("Wayland clipboard type query timed out")?
+        .context("could not run wl-paste --list-types")?;
+        if !listed.status.success() {
+            return Ok(None);
+        }
+        let types = String::from_utf8_lossy(&listed.stdout);
+        let Some((source_mime, response_mime)) = choose_clipboard_mime(&types) else {
+            return Ok(None);
+        };
+
+        let mut paste_command = clipboard_command(&selection, "wl-paste")?;
+        let mut child = paste_command
+            .args(["--no-newline", "--type", &source_mime])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("could not start wl-paste")?;
+        let stdout = child.stdout.take().context("wl-paste stdout unavailable")?;
+        let mut limited = stdout.take((CLIPBOARD_LIMIT + 1) as u64);
+        let mut data = Vec::new();
+        timeout(CLIPBOARD_TIMEOUT, limited.read_to_end(&mut data))
+            .await
+            .context("Wayland clipboard read timed out")?
+            .context("could not read wl-paste output")?;
+        if data.len() > CLIPBOARD_LIMIT {
+            let _ = child.kill().await;
+            anyhow::bail!("Wayland clipboard exceeds the 8 MiB limit");
+        }
+        let status = timeout(CLIPBOARD_TIMEOUT, child.wait())
+            .await
+            .context("wl-paste did not exit")?
+            .context("could not wait for wl-paste")?;
+        if !status.success() {
+            anyhow::bail!("wl-paste could not retrieve {source_mime}");
+        }
+        if data.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ClipboardPayload {
+            mime: response_mime,
+            data,
+        }))
+    }
+
+    async fn write_clipboard(&self, mime: &str, data: &[u8]) -> Result<()> {
+        let selection = self.clipboard_selection()?;
+        let mut copy_command = clipboard_command(&selection, "wl-copy")?;
+        let mut child = copy_command
+            .args(["--type", mime])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("could not start wl-copy")?;
+        let mut stdin = child.stdin.take().context("wl-copy stdin unavailable")?;
+        timeout(CLIPBOARD_TIMEOUT, stdin.write_all(data))
+            .await
+            .context("Wayland clipboard write timed out")?
+            .context("could not write wl-copy input")?;
+        stdin
+            .shutdown()
+            .await
+            .context("could not close wl-copy input")?;
+        drop(stdin);
+        let status = timeout(CLIPBOARD_TIMEOUT, child.wait())
+            .await
+            .context("wl-copy did not accept clipboard data")?
+            .context("could not wait for wl-copy")?;
+        if !status.success() {
+            anyhow::bail!("wl-copy rejected {mime}");
+        }
+        Ok(())
+    }
+
+    fn clipboard_selection(&self) -> Result<DesktopSelection> {
+        if !self.active.load(Ordering::Acquire) {
+            anyhow::bail!("start a desktop before using its clipboard");
+        }
+        let selection = self.selection();
+        if matches!(selection.backend, DesktopBackend::Unavailable) {
+            anyhow::bail!("selected Wayland session is unavailable");
+        }
+        Ok(selection)
+    }
+
     async fn resolved_outputs(&self) -> Result<Vec<ResolvedOutput>> {
         let mut outputs = Vec::new();
         if let Ok(session) = read_forge_session(&self.forge_session_file) {
@@ -996,6 +1180,77 @@ async fn swayctl(socket: &str, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn clipboard_command(selection: &DesktopSelection, program: &str) -> Result<Command> {
+    let mut command = Command::new(program);
+    match &selection.backend {
+        DesktopBackend::Hyprland {
+            signature,
+            wayland_display,
+        } => {
+            command
+                .env("WAYLAND_DISPLAY", wayland_display)
+                .env("HYPRLAND_INSTANCE_SIGNATURE", signature);
+        }
+        DesktopBackend::Sway {
+            wayland_display,
+            sway_socket,
+        } => {
+            command
+                .env("WAYLAND_DISPLAY", wayland_display)
+                .env("SWAYSOCK", sway_socket);
+        }
+        DesktopBackend::Unavailable => anyhow::bail!("selected Wayland session is unavailable"),
+    }
+    Ok(command)
+}
+
+fn choose_clipboard_mime(types: &str) -> Option<(String, String)> {
+    let offered: Vec<&str> = types
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    for mime in ["image/png", "image/jpeg", "image/webp"] {
+        if let Some(found) = offered
+            .iter()
+            .find(|offered| offered.eq_ignore_ascii_case(mime))
+        {
+            return Some(((*found).to_owned(), mime.to_owned()));
+        }
+    }
+    for mime in [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+    ] {
+        if let Some(found) = offered
+            .iter()
+            .find(|offered| offered.eq_ignore_ascii_case(mime))
+        {
+            return Some(((*found).to_owned(), "text/plain;charset=utf-8".into()));
+        }
+    }
+    None
+}
+
+fn supported_upload_mime(content_type: &str) -> Option<&'static str> {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "text/plain" => Some("text/plain;charset=utf-8"),
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 fn read_forge_session(path: &Path) -> Result<ForgeSession> {
@@ -1301,5 +1556,29 @@ mod tests {
         )
         .unwrap();
         assert!(read_forge_session(&path).is_err());
+    }
+
+    #[test]
+    fn clipboard_prefers_images_then_plain_text() {
+        assert_eq!(
+            choose_clipboard_mime("text/plain\nimage/png\ntext/html\n"),
+            Some(("image/png".into(), "image/png".into()))
+        );
+        assert_eq!(
+            choose_clipboard_mime("text/html\nUTF8_STRING\n"),
+            Some(("UTF8_STRING".into(), "text/plain;charset=utf-8".into()))
+        );
+        assert_eq!(choose_clipboard_mime("text/html\nimage/gif\n"), None);
+    }
+
+    #[test]
+    fn clipboard_uploads_accept_only_bounded_formats() {
+        assert_eq!(
+            supported_upload_mime("text/plain; charset=UTF-8"),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(supported_upload_mime("IMAGE/PNG"), Some("image/png"));
+        assert_eq!(supported_upload_mime("image/svg+xml"), None);
+        assert_eq!(supported_upload_mime("application/octet-stream"), None);
     }
 }
