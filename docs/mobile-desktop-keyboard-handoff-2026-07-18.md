@@ -17,11 +17,14 @@
 - `cargo test` (15 passed)
 - `git diff --check`
 
-## Live activation
+## Live activation result
 
-Inspect `euthergate.service`, the local health endpoint and the active desktop
-transport before restart. Use a delayed user-service restart so the current Gate
-request can finish, then reconnect and verify health before testing input.
+No restart was required. EutherGate serves `web/dist` dynamically, and the
+desktop helper is loaded when a desktop connection starts. All three Gate user
+services were active, no desktop helper was running, the live service returned
+`{"status":"ok"}`, and the served hashed JavaScript matched `web/dist` byte for
+byte. The next Desktop session therefore picks up both frontend and helper
+changes without interrupting the current Gate session.
 
 ## Phone smoke test
 
