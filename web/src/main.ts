@@ -138,18 +138,67 @@ function gateWebSocket(path: string): URL {
   return url;
 }
 
-function gateShell(content: string): string {
+type GateView = "login" | "terminal" | "desktop";
+
+function gateShell(content: string, view: GateView = "login"): string {
+  const cockpit = view !== "login";
   return `
-    <main class="gate-shell">
+    <main class="gate-shell${cockpit ? " gate-cockpit" : ""}">
       <header class="topbar">
         <a class="brand" href="${escapeHtml(gateRoot.pathname)}" aria-label="EutherGate home">
           <span class="brand-mark" aria-hidden="true"><i></i></span>
           <span><strong>Euther</strong>Gate</span>
         </a>
-        <div class="gate-state"><span class="pulse"></span><span id="connection-label">LOCAL GATE</span></div>
+        <div class="topbar-context">
+          ${cockpit ? `<span class="topbar-path">GATE CONTROL / ${view.toUpperCase()}</span>` : ""}
+          <div class="gate-state"><span class="pulse"></span><span id="connection-label">LOCAL GATE</span></div>
+        </div>
       </header>
-      ${content}
+      ${cockpit ? `
+        <div class="cockpit-layout">
+          <aside class="gate-sidebar" aria-label="Gate navigation">
+            <div class="sidebar-section">
+              <span class="sidebar-label">WORKSPACE</span>
+              <button class="sidebar-link${view === "terminal" ? " is-active" : ""}" data-gate-view="terminal" type="button">
+                <span>TERMINAL</span><small>Persistent shell</small>
+              </button>
+              <button class="sidebar-link${view === "desktop" ? " is-active" : ""}" data-gate-view="desktop" type="button">
+                <span>DESKTOP</span><small>Remote Wayland</small>
+              </button>
+            </div>
+            <div class="sidebar-section">
+              <span class="sidebar-label">QUICK ACTIONS</span>
+              <button class="sidebar-link sidebar-wake" type="button">
+                <span>WAKE SCREENS</span><small>Preserves lock</small>
+              </button>
+            </div>
+            <div class="sidebar-foot"><span class="pulse"></span> GATE ONLINE</div>
+          </aside>
+          <div class="gate-stage">${content}</div>
+          <aside class="gate-rail" aria-label="Gate status">
+            <section class="rail-card rail-status">
+              <span class="rail-label">STATUS</span>
+              <strong>GATE ONLINE</strong>
+              <small>Encrypted local session</small>
+            </section>
+            <section class="rail-card">
+              <span class="rail-label">ACTIVE VIEW</span>
+              <strong>${view === "terminal" ? "FORGE SHELL" : "WAYLAND DESKTOP"}</strong>
+              <small>${view === "terminal" ? "Persistent PTY channel" : "Live transport control"}</small>
+            </section>
+            <section class="rail-card rail-trace">
+              <span class="rail-label">OXIDATIVE TRACE</span>
+              <p>${view === "terminal" ? "Shell output remains attached across reloads." : "Transport diagnostics appear below the stream."}</p>
+            </section>
+          </aside>
+        </div>` : content}
     </main>`;
+}
+
+function bindCockpitNavigation(): void {
+  document.querySelector<HTMLButtonElement>('[data-gate-view="terminal"]')?.addEventListener("click", renderTerminal);
+  document.querySelector<HTMLButtonElement>('[data-gate-view="desktop"]')?.addEventListener("click", renderDesktop);
+  document.querySelector<HTMLButtonElement>(".sidebar-wake")?.addEventListener("click", wakeScreens);
 }
 
 function renderLogin(message = ""): void {
@@ -196,7 +245,7 @@ function renderTerminal(): void {
       </div>
       <input id="terminal-image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
       <p id="terminal-image-status" class="hint">Ctrl+V pastes clipboard images as a private file path. The shell remains alive when this page is reloaded.</p>
-    </section>`);
+    </section>`, "terminal");
 
   terminal = new Terminal({
     cursorBlink: true,
@@ -238,6 +287,7 @@ function renderTerminal(): void {
   document.querySelector<HTMLButtonElement>("#terminal-image-button")?.addEventListener("click", chooseTerminalImage);
   document.querySelector<HTMLInputElement>("#terminal-image-input")?.addEventListener("change", selectTerminalImage);
   document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
+  bindCockpitNavigation();
   connectSocket();
 }
 
@@ -363,7 +413,7 @@ async function renderDesktop(): Promise<void> {
         <span id="desktop-ice-route">ICE ROUTE · waiting</span>
         <span id="desktop-ice-detail">TURN · probing</span>
       </div>
-    </section>`);
+    </section>`, "desktop");
 
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>(".wake-screens")?.addEventListener("click", wakeScreens);
@@ -374,6 +424,7 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
   document.querySelector<HTMLSelectElement>("#desktop-transport-picker")?.addEventListener("change", switchDesktopTransport);
   document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker")?.addEventListener("change", switchVncPerformanceProfile);
+  bindCockpitNavigation();
   installClipboardBridge();
   installDesktopInput();
 
