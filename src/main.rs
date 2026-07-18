@@ -44,6 +44,7 @@ use tokio::{
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
 use tracing::{error, info, warn};
@@ -353,8 +354,15 @@ async fn main() -> Result<()> {
         }),
     };
 
-    let static_files = ServeDir::new(&config.web_root)
-        .fallback(ServeFile::new(config.web_root.join("index.html")));
+    let static_files = Router::new()
+        .fallback_service(
+            ServeDir::new(&config.web_root)
+                .fallback(ServeFile::new(config.web_root.join("index.html"))),
+        )
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ));
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))

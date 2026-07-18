@@ -26,6 +26,15 @@ services were active, no desktop helper was running, the live service returned
 byte. The next Desktop session therefore picks up both frontend and helper
 changes without interrupting the current Gate session.
 
+## Mobile cache follow-up
+
+The public tunnel was verified to serve the current `index-CUKbo67x.js`, while
+an already open Android tab still displayed the previous action row without
+`KEYBOARD`. Static UI responses now carry `Cache-Control: no-store` so reopening
+or reloading Gate cannot keep a stale entry HTML or JavaScript bundle. Activating
+that response-header change requires one gateway restart; the tunnel and Forge
+services do not need to be restarted.
+
 ## Phone smoke test
 
 1. Open Desktop and wait for `LIVE`.
