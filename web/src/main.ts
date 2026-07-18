@@ -87,6 +87,22 @@ type DesktopPinch = {
   panY: number;
 };
 
+type VncDisplayBridge = {
+  scale: number;
+};
+
+type VncSessionBridge = RFB & {
+  clipViewport: boolean;
+  dragViewport: boolean;
+  _display?: VncDisplayBridge;
+};
+
+type VncGestureDetail = {
+  type: string;
+  magnitudeX?: number;
+  magnitudeY?: number;
+};
+
 const appNode = document.querySelector<HTMLDivElement>("#app");
 if (!appNode) throw new Error("Missing #app");
 const app: HTMLDivElement = appNode;
@@ -122,6 +138,10 @@ let desktopPinch: DesktopPinch | null = null;
 let desktopViewScale = 1;
 let desktopViewPanX = 0;
 let desktopViewPanY = 0;
+let desktopVncFitScale = 1;
+let desktopVncPinchDistance = 1;
+let desktopVncPinchStartScale = 1;
+const desktopTouchReleaseTimers = new Set<number>();
 
 const clipboardLimit = 8 * 1024 * 1024;
 const transportPreferenceKey = "euthergate.transport-profile";
@@ -980,6 +1000,7 @@ function connectVncDesktop(attempt = 0): void {
       const transport = document.querySelector<HTMLElement>("#desktop-transport");
       if (transport) transport.textContent = `RFB ${performance.fps} FPS${performance.gpu ? " GPU/H.264" : ""} / WSS`;
       session.focus();
+      window.requestAnimationFrame(() => installVncTouchZoom(session, target));
     });
     session.addEventListener("disconnect", (event) => {
       if (vnc !== session) return;
@@ -1345,7 +1366,7 @@ function desktopTouchMove(frame: HTMLDivElement, event: PointerEvent): void {
   event.preventDefault();
   point.clientX = event.clientX;
   point.clientY = event.clientY;
-  if (Math.hypot(point.clientX - point.startX, point.clientY - point.startY) > 8) {
+  if (Math.hypot(point.clientX - point.startX, point.clientY - point.startY) > 16) {
     point.moved = true;
   }
 
@@ -1383,7 +1404,11 @@ function desktopTouchEnd(frame: HTMLDivElement, event: PointerEvent, cancelled: 
     if (position) {
       sendDesktopInput({ type: "pointer_move", x: position.x, y: position.y });
       sendDesktopInput({ type: "pointer_button", button: 0, state: "pressed" });
-      sendDesktopInput({ type: "pointer_button", button: 0, state: "released" });
+      const releaseTimer = window.setTimeout(() => {
+        desktopTouchReleaseTimers.delete(releaseTimer);
+        sendDesktopInput({ type: "pointer_button", button: 0, state: "released" });
+      }, 45);
+      desktopTouchReleaseTimers.add(releaseTimer);
     }
   }
   if (desktopTouches.size === 0) setDesktopState(desktopViewScale > 1.01 ? `ZOOM ${Math.round(desktopViewScale * 100)}%` : "LIVE");
@@ -1453,6 +1478,54 @@ function applyDesktopViewTransform(): void {
   }
 }
 
+function vncDisplayBridge(session: RFB): VncDisplayBridge | null {
+  return (session as unknown as VncSessionBridge)._display || null;
+}
+
+function installVncTouchZoom(session: RFB, target: HTMLDivElement): void {
+  const canvas = target.querySelector<HTMLCanvasElement>("canvas");
+  const display = vncDisplayBridge(session);
+  const sessionBridge = session as unknown as VncSessionBridge;
+  if (!canvas || !display || vnc !== session) return;
+  desktopVncFitScale = display.scale || 1;
+
+  const handleGesture = (rawEvent: Event): void => {
+    const event = rawEvent as CustomEvent<VncGestureDetail>;
+    if (event.detail?.type !== "pinch" || vnc !== session) return;
+    event.stopImmediatePropagation();
+    const magnitude = Math.max(1, Math.hypot(event.detail.magnitudeX || 0, event.detail.magnitudeY || 0));
+    if (event.type === "gesturestart") {
+      desktopVncPinchDistance = magnitude;
+      desktopVncPinchStartScale = desktopViewScale;
+      if (desktopViewScale <= 1.01) desktopVncFitScale = display.scale || 1;
+      session.scaleViewport = false;
+      sessionBridge.clipViewport = true;
+      sessionBridge.dragViewport = true;
+      display.scale = desktopVncFitScale * desktopViewScale;
+      setDesktopState("PINCH ZOOM");
+      return;
+    }
+    if (event.type === "gesturemove") {
+      desktopViewScale = Math.max(1, Math.min(4, desktopVncPinchStartScale * magnitude / desktopVncPinchDistance));
+      if (desktopViewScale <= 1.01) {
+        resetDesktopView();
+        return;
+      }
+      display.scale = desktopVncFitScale * desktopViewScale;
+      applyDesktopViewTransform();
+      setDesktopState(`ZOOM ${Math.round(desktopViewScale * 100)}%`);
+      return;
+    }
+    if (event.type === "gestureend") {
+      setDesktopState(desktopViewScale > 1.01 ? `ZOOM ${Math.round(desktopViewScale * 100)}%` : "LIVE");
+    }
+  };
+
+  canvas.addEventListener("gesturestart", handleGesture, { capture: true });
+  canvas.addEventListener("gesturemove", handleGesture, { capture: true });
+  canvas.addEventListener("gestureend", handleGesture, { capture: true });
+}
+
 function resetDesktopView(event?: Event): void {
   event?.preventDefault();
   event?.stopPropagation();
@@ -1461,6 +1534,13 @@ function resetDesktopView(event?: Event): void {
   desktopViewPanY = 0;
   desktopPinch = null;
   desktopTouches.clear();
+  if (desktopVncActive && vnc) {
+    const sessionBridge = vnc as unknown as VncSessionBridge;
+    sessionBridge.dragViewport = false;
+    vnc.scaleViewport = true;
+    sessionBridge.clipViewport = false;
+    desktopVncFitScale = vncDisplayBridge(vnc)?.scale || 1;
+  }
   applyDesktopViewTransform();
   if (desktopVideoReady) setDesktopState("LIVE");
 }
@@ -1838,6 +1918,13 @@ function disposeDesktop(): void {
   remoteCandidates = [];
   desktopVideoReady = false;
   desktopControlActive = false;
+  if (desktopTouchReleaseTimers.size > 0) {
+    for (const timer of desktopTouchReleaseTimers) window.clearTimeout(timer);
+    desktopTouchReleaseTimers.clear();
+    if (desktopVideoReady && !desktopVncActive) {
+      sendDesktopInput({ type: "pointer_button", button: 0, state: "released" });
+    }
+  }
   resetDesktopView();
   const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
   if (mobileInput) {
