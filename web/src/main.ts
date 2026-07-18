@@ -67,6 +67,26 @@ type IceCandidatePairStats = RTCStats & {
   remoteCandidateId: string;
 };
 
+type DesktopTouchPoint = {
+  startX: number;
+  startY: number;
+  clientX: number;
+  clientY: number;
+  startPanX: number;
+  startPanY: number;
+  moved: boolean;
+  consumed: boolean;
+};
+
+type DesktopPinch = {
+  distance: number;
+  midpointX: number;
+  midpointY: number;
+  scale: number;
+  panX: number;
+  panY: number;
+};
+
 const appNode = document.querySelector<HTMLDivElement>("#app");
 if (!appNode) throw new Error("Missing #app");
 const app: HTMLDivElement = appNode;
@@ -97,6 +117,11 @@ let desktopSelectedRoute = "none";
 let proxiedSession = false;
 let clipboardPreviewUrl: string | null = null;
 let remoteClipboardBlob: Blob | null = null;
+const desktopTouches = new Map<number, DesktopTouchPoint>();
+let desktopPinch: DesktopPinch | null = null;
+let desktopViewScale = 1;
+let desktopViewPanX = 0;
+let desktopViewPanY = 0;
 
 const clipboardLimit = 8 * 1024 * 1024;
 const transportPreferenceKey = "euthergate.transport-profile";
@@ -395,6 +420,8 @@ async function renderDesktop(): Promise<void> {
         <textarea id="desktop-mobile-input" class="desktop-mobile-input" rows="1" inputmode="text"
           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
           aria-label="Mobile keyboard input for the remote desktop"></textarea>
+        <div class="desktop-touch-hint">TAP = CLICK · DRAG = POINTER · PINCH = ZOOM</div>
+        <button id="desktop-zoom-reset" class="desktop-zoom-reset" type="button" hidden>VIEW 100%</button>
         <div class="desktop-empty" id="desktop-empty">
           <span class="brand-mark large" aria-hidden="true"><i></i></span>
           <strong>Virtual Wayland output offline</strong>
@@ -421,6 +448,9 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
   document.querySelector<HTMLButtonElement>("#desktop-keyboard")?.addEventListener("click", focusDesktopKeyboard);
+  const zoomReset = document.querySelector<HTMLButtonElement>("#desktop-zoom-reset");
+  zoomReset?.addEventListener("pointerdown", (event) => event.stopPropagation());
+  zoomReset?.addEventListener("click", resetDesktopView);
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
   document.querySelector<HTMLSelectElement>("#desktop-transport-picker")?.addEventListener("change", switchDesktopTransport);
   document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker")?.addEventListener("change", switchVncPerformanceProfile);
@@ -1224,6 +1254,10 @@ function installDesktopInput(): void {
   mobileInput?.addEventListener("beforeinput", desktopMobileBeforeInput);
   frame.addEventListener("pointermove", (event) => {
     if (desktopVncActive) return;
+    if (event.pointerType === "touch") {
+      desktopTouchMove(frame, event);
+      return;
+    }
     if (!desktopControlActive) return;
     if (document.pointerLockElement === frame) {
       sendDesktopInput({ type: "pointer_delta", dx: event.movementX, dy: event.movementY });
@@ -1241,18 +1275,36 @@ function installDesktopInput(): void {
     if (desktopVncActive) return;
     if (!desktopVideoReady) return;
     event.preventDefault();
+    if (event.pointerType === "touch") {
+      desktopTouchStart(frame, event);
+      return;
+    }
     const position = remotePositionFromClient(event.clientX, event.clientY);
     if (position) {
       sendDesktopInput({ type: "pointer_move", x: position.x, y: position.y });
     }
     desktopControlActive = true;
     frame.focus();
-    if (document.pointerLockElement !== frame) frame.requestPointerLock();
+    if (document.pointerLockElement !== frame) {
+      const lockRequest = frame.requestPointerLock();
+      if (lockRequest) {
+        void lockRequest.catch(() => {
+          setDesktopState("CONTROL / POINTER LOCK BLOCKED");
+        });
+      }
+    }
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
   });
   frame.addEventListener("pointerup", (event) => {
     if (desktopVncActive) return;
+    if (event.pointerType === "touch") {
+      desktopTouchEnd(frame, event, false);
+      return;
+    }
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "released" });
+  });
+  frame.addEventListener("pointercancel", (event) => {
+    if (event.pointerType === "touch") desktopTouchEnd(frame, event, true);
   });
   frame.addEventListener("contextmenu", (event) => event.preventDefault());
   frame.addEventListener("wheel", (event) => {
@@ -1263,6 +1315,154 @@ function installDesktopInput(): void {
   window.addEventListener("keydown", desktopKeyEvent, { capture: true });
   window.addEventListener("keyup", desktopKeyEvent, { capture: true });
   document.addEventListener("pointerlockchange", desktopPointerLockChange);
+}
+
+function desktopTouchStart(frame: HTMLDivElement, event: PointerEvent): void {
+  try {
+    frame.setPointerCapture(event.pointerId);
+  } catch {
+    // Safari can retain the pointer without explicit capture.
+  }
+  desktopTouches.set(event.pointerId, {
+    startX: event.clientX,
+    startY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    startPanX: desktopViewPanX,
+    startPanY: desktopViewPanY,
+    moved: false,
+    consumed: false,
+  });
+  desktopControlActive = true;
+  frame.focus({ preventScroll: true });
+  if (desktopTouches.size >= 2) beginDesktopPinch(frame);
+  setDesktopState(desktopTouches.size >= 2 ? "PINCH ZOOM" : "TOUCH CONTROL");
+}
+
+function desktopTouchMove(frame: HTMLDivElement, event: PointerEvent): void {
+  const point = desktopTouches.get(event.pointerId);
+  if (!point) return;
+  event.preventDefault();
+  point.clientX = event.clientX;
+  point.clientY = event.clientY;
+  if (Math.hypot(point.clientX - point.startX, point.clientY - point.startY) > 8) {
+    point.moved = true;
+  }
+
+  if (desktopTouches.size >= 2) {
+    if (!desktopPinch) beginDesktopPinch(frame);
+    updateDesktopPinch(frame);
+    return;
+  }
+  if (point.consumed || !point.moved) return;
+
+  if (desktopViewScale > 1.01) {
+    desktopViewPanX = point.startPanX + point.clientX - point.startX;
+    desktopViewPanY = point.startPanY + point.clientY - point.startY;
+    clampDesktopViewPan(frame);
+    applyDesktopViewTransform();
+    return;
+  }
+
+  const position = remotePositionFromClient(event.clientX, event.clientY);
+  if (position) sendDesktopInput({ type: "pointer_move", x: position.x, y: position.y });
+}
+
+function desktopTouchEnd(frame: HTMLDivElement, event: PointerEvent, cancelled: boolean): void {
+  const point = desktopTouches.get(event.pointerId);
+  if (!point) return;
+  event.preventDefault();
+  point.clientX = event.clientX;
+  point.clientY = event.clientY;
+  const shouldClick = !cancelled && !point.consumed && !point.moved && desktopTouches.size === 1;
+  desktopTouches.delete(event.pointerId);
+  if (desktopTouches.size < 2) desktopPinch = null;
+
+  if (shouldClick) {
+    const position = remotePositionFromClient(event.clientX, event.clientY);
+    if (position) {
+      sendDesktopInput({ type: "pointer_move", x: position.x, y: position.y });
+      sendDesktopInput({ type: "pointer_button", button: 0, state: "pressed" });
+      sendDesktopInput({ type: "pointer_button", button: 0, state: "released" });
+    }
+  }
+  if (desktopTouches.size === 0) setDesktopState(desktopViewScale > 1.01 ? `ZOOM ${Math.round(desktopViewScale * 100)}%` : "LIVE");
+  try {
+    frame.releasePointerCapture(event.pointerId);
+  } catch {
+    // The browser may already have released a cancelled pointer.
+  }
+}
+
+function beginDesktopPinch(frame: HTMLDivElement): void {
+  const points = [...desktopTouches.values()].slice(0, 2);
+  if (points.length < 2) return;
+  for (const point of desktopTouches.values()) point.consumed = true;
+  const rect = frame.getBoundingClientRect();
+  desktopPinch = {
+    distance: Math.max(1, Math.hypot(points[0].clientX - points[1].clientX, points[0].clientY - points[1].clientY)),
+    midpointX: (points[0].clientX + points[1].clientX) / 2 - rect.left,
+    midpointY: (points[0].clientY + points[1].clientY) / 2 - rect.top,
+    scale: desktopViewScale,
+    panX: desktopViewPanX,
+    panY: desktopViewPanY,
+  };
+}
+
+function updateDesktopPinch(frame: HTMLDivElement): void {
+  const points = [...desktopTouches.values()].slice(0, 2);
+  if (!desktopPinch || points.length < 2) return;
+  const rect = frame.getBoundingClientRect();
+  const midpointX = (points[0].clientX + points[1].clientX) / 2 - rect.left;
+  const midpointY = (points[0].clientY + points[1].clientY) / 2 - rect.top;
+  const distance = Math.max(1, Math.hypot(points[0].clientX - points[1].clientX, points[0].clientY - points[1].clientY));
+  const nextScale = Math.max(1, Math.min(4, desktopPinch.scale * distance / desktopPinch.distance));
+  const ratio = nextScale / desktopPinch.scale;
+  desktopViewScale = nextScale;
+  desktopViewPanX = midpointX - frame.clientWidth / 2
+    - (desktopPinch.midpointX - frame.clientWidth / 2 - desktopPinch.panX) * ratio;
+  desktopViewPanY = midpointY - frame.clientHeight / 2
+    - (desktopPinch.midpointY - frame.clientHeight / 2 - desktopPinch.panY) * ratio;
+  clampDesktopViewPan(frame);
+  applyDesktopViewTransform();
+  setDesktopState(`ZOOM ${Math.round(desktopViewScale * 100)}%`);
+}
+
+function clampDesktopViewPan(frame: HTMLDivElement): void {
+  const maxX = frame.clientWidth * (desktopViewScale - 1) / 2;
+  const maxY = frame.clientHeight * (desktopViewScale - 1) / 2;
+  desktopViewPanX = Math.max(-maxX, Math.min(maxX, desktopViewPanX));
+  desktopViewPanY = Math.max(-maxY, Math.min(maxY, desktopViewPanY));
+  if (desktopViewScale <= 1.01) {
+    desktopViewScale = 1;
+    desktopViewPanX = 0;
+    desktopViewPanY = 0;
+  }
+}
+
+function applyDesktopViewTransform(): void {
+  const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  if (!frame) return;
+  frame.style.setProperty("--desktop-view-scale", String(desktopViewScale));
+  frame.style.setProperty("--desktop-view-pan-x", `${desktopViewPanX}px`);
+  frame.style.setProperty("--desktop-view-pan-y", `${desktopViewPanY}px`);
+  const reset = document.querySelector<HTMLButtonElement>("#desktop-zoom-reset");
+  if (reset) {
+    reset.hidden = desktopViewScale <= 1.01;
+    reset.textContent = `VIEW ${Math.round(desktopViewScale * 100)}% · RESET`;
+  }
+}
+
+function resetDesktopView(event?: Event): void {
+  event?.preventDefault();
+  event?.stopPropagation();
+  desktopViewScale = 1;
+  desktopViewPanX = 0;
+  desktopViewPanY = 0;
+  desktopPinch = null;
+  desktopTouches.clear();
+  applyDesktopViewTransform();
+  if (desktopVideoReady) setDesktopState("LIVE");
 }
 
 function desktopKeyEvent(event: KeyboardEvent): void {
@@ -1444,11 +1644,15 @@ function remoteVideoMetrics(): { left: number; top: number; width: number; heigh
   const frameHeight = frame.clientHeight;
   if (!frameWidth || !frameHeight) return null;
   const scale = Math.min(frameWidth / sourceWidth, frameHeight / sourceHeight);
-  const width = sourceWidth * scale;
-  const height = sourceHeight * scale;
+  const baseWidth = sourceWidth * scale;
+  const baseHeight = sourceHeight * scale;
+  const baseLeft = (frameWidth - baseWidth) / 2;
+  const baseTop = (frameHeight - baseHeight) / 2;
+  const width = baseWidth * desktopViewScale;
+  const height = baseHeight * desktopViewScale;
   return {
-    left: (frameWidth - width) / 2,
-    top: (frameHeight - height) / 2,
+    left: frameWidth / 2 + (baseLeft - frameWidth / 2) * desktopViewScale + desktopViewPanX,
+    top: frameHeight / 2 + (baseTop - frameHeight / 2) * desktopViewScale + desktopViewPanY,
     width,
     height,
     sourceWidth,
@@ -1634,6 +1838,7 @@ function disposeDesktop(): void {
   remoteCandidates = [];
   desktopVideoReady = false;
   desktopControlActive = false;
+  resetDesktopView();
   const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
   if (mobileInput) {
     mobileInput.value = "";

@@ -115,6 +115,9 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 .clipboard-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
 .clipboard-actions button { min-height: 42px; }
 .desktop-frame {
+  --desktop-view-scale: 1;
+  --desktop-view-pan-x: 0px;
+  --desktop-view-pan-y: 0px;
   position: relative; flex: 1; min-height: 360px; overflow: hidden; outline: none;
   border: 1px solid #2b3233; background: #050608;
   box-shadow: 0 25px 80px rgba(0,0,0,.45); touch-action: none;
@@ -128,6 +131,12 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 .desktop-frame video,
 .desktop-frame > img,
 .desktop-frame > #desktop-vnc { width: 100%; height: 100%; display: block; object-fit: contain; background: #050608; }
+.desktop-frame video,
+.desktop-frame > img {
+  transform: translate(var(--desktop-view-pan-x), var(--desktop-view-pan-y)) scale(var(--desktop-view-scale));
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
 .desktop-frame video[hidden],
 .desktop-frame > img[hidden],
 .desktop-frame > #desktop-vnc[hidden] { display: none; }
@@ -144,6 +153,21 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
 .desktop-empty .large { width: 38px; height: 46px; margin-bottom: 12px; }
 .desktop-empty strong { color: #cfd6d1; font-size: 15px; }
 .desktop-empty p { max-width: 430px; margin: 0; color: #69736d; font: 11px/1.7 "Space Mono", monospace; }
+.desktop-touch-hint,
+.desktop-zoom-reset {
+  position: absolute;
+  z-index: 4;
+  top: 10px;
+  border: 1px solid rgba(199, 255, 74, .22);
+  border-radius: 6px;
+  color: rgba(231, 243, 204, .78);
+  background: rgba(5, 9, 7, .82);
+  font: 700 8px "Space Mono", monospace;
+  letter-spacing: .08em;
+}
+.desktop-touch-hint { display: none; left: 10px; padding: 7px 9px; pointer-events: none; }
+.desktop-zoom-reset { right: 10px; min-height: 30px; padding: 6px 9px; }
+.desktop-zoom-reset[hidden] { display: none; }
 .stream-hud {
   position: absolute; left: 12px; right: 12px; bottom: 10px; display: flex;
   justify-content: space-between; pointer-events: none; color: rgba(220,230,223,.48);
@@ -183,6 +207,10 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   .vnc-profile-picker { max-width: 160px; }
   #desktop-terminal { display: none; }
   #desktop-keyboard { order: -1; }
+}
+
+@media (pointer: coarse) {
+  .desktop-touch-hint { display: block; }
 }
 
 /* EutherOxide-inspired Gate control room */
