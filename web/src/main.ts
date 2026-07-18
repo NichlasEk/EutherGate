@@ -314,6 +314,7 @@ async function renderDesktop(): Promise<void> {
           <select id="desktop-vnc-profile-picker" class="output-picker vnc-profile-picker" aria-label="VNC performance" hidden></select>
           <button id="desktop-terminal" class="ghost-button" type="button" disabled>OPEN TERMINAL</button>
           <button id="desktop-clipboard" class="ghost-button" type="button" disabled>CLIPBOARD</button>
+          <button id="desktop-keyboard" class="ghost-button primary-action" type="button" disabled>KEYBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
           <button id="desktop-power" class="ghost-button primary-action" type="button" disabled>START DESKTOP</button>
         </div>
@@ -341,6 +342,9 @@ async function renderDesktop(): Promise<void> {
         <video id="desktop-video" autoplay playsinline muted></video>
         <img id="desktop-fallback-image" alt="Remote desktop over HTTPS WebSocket" hidden />
         <div id="desktop-vnc" aria-label="Remote desktop over VNC WebSocket" hidden></div>
+        <textarea id="desktop-mobile-input" class="desktop-mobile-input" rows="1" inputmode="text"
+          autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+          aria-label="Mobile keyboard input for the remote desktop"></textarea>
         <div class="desktop-empty" id="desktop-empty">
           <span class="brand-mark large" aria-hidden="true"><i></i></span>
           <strong>Virtual Wayland output offline</strong>
@@ -352,7 +356,7 @@ async function renderDesktop(): Promise<void> {
         </div>
       </div>
       <div class="desktop-footer">
-        <span>Click to enter remote control · Esc returns locally · VNC: hold F8 for remote Super.</span>
+        <span>Click to control · Keyboard opens mobile input · Esc returns locally · VNC: hold F8 for remote Super.</span>
         <span id="desktop-mode">1280×720 @ 30</span>
       </div>
       <div class="desktop-network" aria-live="polite">
@@ -366,6 +370,7 @@ async function renderDesktop(): Promise<void> {
   document.querySelector<HTMLButtonElement>("#desktop-power")?.addEventListener("click", toggleDesktop);
   document.querySelector<HTMLButtonElement>("#desktop-terminal")?.addEventListener("click", launchDesktopTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-clipboard")?.addEventListener("click", openClipboardPanel);
+  document.querySelector<HTMLButtonElement>("#desktop-keyboard")?.addEventListener("click", focusDesktopKeyboard);
   document.querySelector<HTMLSelectElement>("#desktop-output-picker")?.addEventListener("change", switchDesktopOutput);
   document.querySelector<HTMLSelectElement>("#desktop-transport-picker")?.addEventListener("change", switchDesktopTransport);
   document.querySelector<HTMLSelectElement>("#desktop-vnc-profile-picker")?.addEventListener("change", switchVncPerformanceProfile);
@@ -423,6 +428,8 @@ function updateDesktopStatus(status: DesktopStatus): void {
   if (terminalButton) terminalButton.disabled = !status.active;
   const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
   if (clipboardButton) clipboardButton.disabled = !status.active;
+  const keyboardButton = document.querySelector<HTMLButtonElement>("#desktop-keyboard");
+  if (keyboardButton) keyboardButton.disabled = !status.active;
   setDesktopState(status.active ? "NEGOTIATING" : "OFFLINE");
 }
 
@@ -446,6 +453,8 @@ async function toggleDesktop(): Promise<void> {
       if (terminalButton) terminalButton.disabled = true;
       const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
       if (clipboardButton) clipboardButton.disabled = true;
+      const keyboardButton = document.querySelector<HTMLButtonElement>("#desktop-keyboard");
+      if (keyboardButton) keyboardButton.disabled = true;
       setDesktopState("OFFLINE");
       showDesktopMessage("Virtual Wayland output offline");
     } else {
@@ -453,6 +462,8 @@ async function toggleDesktop(): Promise<void> {
       if (terminalButton) terminalButton.disabled = false;
       const clipboardButton = document.querySelector<HTMLButtonElement>("#desktop-clipboard");
       if (clipboardButton) clipboardButton.disabled = false;
+      const keyboardButton = document.querySelector<HTMLButtonElement>("#desktop-keyboard");
+      if (keyboardButton) keyboardButton.disabled = false;
       connectDesktop();
     }
   } catch (error) {
@@ -1155,7 +1166,11 @@ function markDesktopVideoReady(): void {
 
 function installDesktopInput(): void {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
+  const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
   if (!frame) return;
+  mobileInput?.addEventListener("input", desktopMobileInput);
+  mobileInput?.addEventListener("compositionend", flushDesktopMobileInput);
+  mobileInput?.addEventListener("beforeinput", desktopMobileBeforeInput);
   frame.addEventListener("pointermove", (event) => {
     if (desktopVncActive) return;
     if (!desktopControlActive) return;
@@ -1200,12 +1215,20 @@ function installDesktopInput(): void {
 }
 
 function desktopKeyEvent(event: KeyboardEvent): void {
-  if (desktopVncActive) return;
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
-  if (!frame || document.activeElement !== frame) return;
+  const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
+  const activeElement = document.activeElement;
+  if (!frame || (activeElement !== frame && activeElement !== mobileInput)) return;
+  if (desktopVncActive && activeElement !== mobileInput) return;
+  if (activeElement === mobileInput && (!event.code || event.code === "Unidentified")) return;
   event.preventDefault();
-  if (event.code === "Escape") {
+  if (activeElement === mobileInput) event.stopImmediatePropagation();
+  if (event.code === "Escape" && activeElement === frame) {
     if (event.type === "keydown") releaseDesktopControl();
+    return;
+  }
+  if (desktopVncActive) {
+    sendVncKeyboardEvent(event);
     return;
   }
   sendDesktopInput({
@@ -1218,6 +1241,107 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     shift: event.shiftKey,
     meta: event.metaKey,
   });
+}
+
+function focusDesktopKeyboard(): void {
+  const input = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
+  if (!input || !desktopVideoReady) return;
+  if (document.pointerLockElement) document.exitPointerLock();
+  input.value = "";
+  input.focus({ preventScroll: true });
+  setDesktopState("MOBILE KEYBOARD");
+}
+
+function desktopMobileInput(event: Event): void {
+  if ((event as InputEvent).isComposing) return;
+  flushDesktopMobileInput();
+}
+
+function flushDesktopMobileInput(): void {
+  const input = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
+  if (!input?.value) return;
+  sendDesktopText(input.value);
+  input.value = "";
+}
+
+function desktopMobileBeforeInput(event: InputEvent): void {
+  const code = {
+    deleteContentBackward: "Backspace",
+    deleteContentForward: "Delete",
+    insertLineBreak: "Enter",
+    insertParagraph: "Enter",
+  }[event.inputType];
+  if (!code) return;
+  event.preventDefault();
+  sendDesktopKeyTap(code);
+}
+
+function sendDesktopText(text: string): void {
+  if (!desktopVideoReady || !text) return;
+  if (desktopVncActive) {
+    for (const character of text) {
+      const codePoint = character.codePointAt(0);
+      if (codePoint === undefined) continue;
+      const keysym = unicodeKeysym(codePoint);
+      vnc?.sendKey(keysym, "", true);
+      vnc?.sendKey(keysym, "", false);
+    }
+    return;
+  }
+  for (let offset = 0; offset < text.length; offset += 128) {
+    sendDesktopInput({ type: "text", text: text.slice(offset, offset + 128) });
+  }
+}
+
+function sendDesktopKeyTap(code: string): void {
+  if (desktopVncActive) {
+    const keysym = vncKeysymForCode(code);
+    if (keysym === null) return;
+    vnc?.sendKey(keysym, code, true);
+    vnc?.sendKey(keysym, code, false);
+    return;
+  }
+  sendDesktopInput({ type: "key", code, state: "pressed", repeat: false });
+  sendDesktopInput({ type: "key", code, state: "released", repeat: false });
+}
+
+function sendVncKeyboardEvent(event: KeyboardEvent): void {
+  const keysym = vncKeysymForKeyboardEvent(event);
+  if (keysym === null) return;
+  vnc?.sendKey(keysym, event.code, event.type === "keydown");
+}
+
+function vncKeysymForKeyboardEvent(event: KeyboardEvent): number | null {
+  if (event.key.length === 1) return unicodeKeysym(event.key.codePointAt(0) || 0);
+  const side = event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Right" : "Left";
+  const modifier = {
+    Shift: side === "Right" ? 0xffe2 : 0xffe1,
+    Control: side === "Right" ? 0xffe4 : 0xffe3,
+    Alt: side === "Right" ? 0xffea : 0xffe9,
+    Meta: side === "Right" ? 0xffec : 0xffeb,
+  }[event.key];
+  if (modifier !== undefined) return modifier;
+  return vncKeysymForCode(event.code);
+}
+
+function vncKeysymForCode(code: string): number | null {
+  const special: Record<string, number> = {
+    Backspace: 0xff08, Tab: 0xff09, Enter: 0xff0d, NumpadEnter: 0xff0d,
+    Escape: 0xff1b, Home: 0xff50, ArrowLeft: 0xff51, ArrowUp: 0xff52,
+    ArrowRight: 0xff53, ArrowDown: 0xff54, PageUp: 0xff55, PageDown: 0xff56,
+    End: 0xff57, Insert: 0xff63, Delete: 0xffff,
+  };
+  if (special[code] !== undefined) return special[code];
+  const functionKey = /^F(\d{1,2})$/.exec(code);
+  if (functionKey) {
+    const number = Number(functionKey[1]);
+    if (number >= 1 && number <= 12) return 0xffbd + number;
+  }
+  return null;
+}
+
+function unicodeKeysym(codePoint: number): number {
+  return codePoint >= 0x20 && codePoint <= 0xff ? codePoint : 0x01000000 | codePoint;
 }
 
 function vncSuperKeyEvent(event: KeyboardEvent): void {
@@ -1459,6 +1583,11 @@ function disposeDesktop(): void {
   remoteCandidates = [];
   desktopVideoReady = false;
   desktopControlActive = false;
+  const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
+  if (mobileInput) {
+    mobileInput.value = "";
+    mobileInput.blur();
+  }
   desktopFallbackActive = false;
   desktopVncActive = false;
   vnc?.disconnect();

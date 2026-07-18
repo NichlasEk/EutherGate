@@ -367,6 +367,11 @@ class InputController:
             # wtype injects through Wayland's virtual-keyboard protocol and works
             # for both regular clients and the compositor lock surface.
             run_wtype(key, modifiers)
+        elif kind == "text":
+            text = event.get("text")
+            if not isinstance(text, str) or not text or len(text) > 512 or "\0" in text:
+                return
+            run_wtype_text(text)
 
     def update_pointer(self, event: dict) -> None:
         if event.get("type") == "pointer_move":
@@ -465,6 +470,16 @@ def run_wtype(key: str, modifiers: list[str]) -> None:
     for modifier in reversed(modifiers):
         command.extend(["-m", modifier_names[modifier]])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1)
+
+
+def run_wtype_text(text: str) -> None:
+    subprocess.run(
+        ["wtype", "--", text],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=2,
+    )
 
 
 def sway_key(key: str) -> str:
