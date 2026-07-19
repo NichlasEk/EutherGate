@@ -7,7 +7,7 @@ The first two checkpoints form a usable vertical slice:
 
 - token login with an HttpOnly, SameSite cookie;
 - a real PTY-backed shell in the browser;
-- one persistent terminal session that survives browser reloads;
+- named tmux sessions that survive browser and gateway restarts;
 - resize support and a bounded output replay buffer;
 - a small health/status API for automation.
 - a persistent pre-login Forge desktop plus selectable logged-in Hyprland outputs;
@@ -103,6 +103,14 @@ Codex or another terminal tool can open it. **PASTE IMAGE** is the file-picker
 fallback for browsers that do not expose image clipboard data. Images are
 limited to 8 MiB and are not written to the repository.
 
+Gate Shell starts in the `gate` tmux session. Use the session picker to attach
+to another managed terminal or **+ SESSION** to create one. The selected session
+is remembered per browser. `OPEN TERMINAL` on the remote desktop opens Kitty
+attached to that same tmux session, so the browser and local window share the
+same programs and terminal contents. From a local shell, the same server is
+available with `tmux -L euthergate list-sessions` and
+`tmux -L euthergate attach-session -t gate`.
+
 The full media and input smoke test requires a running gateway and Forge
 session:
 
@@ -132,9 +140,12 @@ Install the release gateway and its persistent reverse tunnel as user services:
 
 This generates a private `EUTHERGATE_PROXY_TOKEN` when needed, builds the web
 UI and release binary, and enables `euthergate-forge.service`,
-`euthergate.service` and `euthergate-tunnel.service`. With systemd user
-lingering enabled, the Forge compositor, gateway and tunnel start at boot before
-graphical login. The tunnel exposes the gateway only as
+`euthergate-tmux.service`, `euthergate.service` and
+`euthergate-tunnel.service`. The dedicated tmux service is deliberately not
+restarted on ordinary installs, so its shells outlive gateway upgrades. With
+systemd user lingering enabled, the Forge compositor, tmux server, gateway and
+tunnel start at boot before graphical login. The tunnel exposes the gateway
+only as
 `127.0.0.1:18787` on the EutherOxide host; it does not bind a public server
 port. EutherOxide must authenticate an admin request, strip the `/euthergate`
 prefix, and add the configured token as `X-EutherGate-Proxy-Token` to HTTP and
@@ -146,8 +157,10 @@ WebSocket upstream requests.
 | --- | --- | --- |
 | `EUTHERGATE_TOKEN` | generated at startup | Login credential. Set this outside local development. |
 | `EUTHERGATE_BIND` | `127.0.0.1:8787` | Gateway listen address. |
-| `EUTHERGATE_SHELL` | `$SHELL`, then `/bin/sh` | Shell started inside the PTY. |
+| `EUTHERGATE_SHELL` | `$SHELL`, then `/bin/sh` | Shell used for newly created tmux sessions. |
 | `EUTHERGATE_WORKDIR` | current directory | Initial directory for the shell. |
+| `EUTHERGATE_TMUX` | discovered from `PATH` | Required tmux executable. |
+| `EUTHERGATE_TMUX_SOCKET` | `euthergate` | Private tmux server name used by Gate Shell. |
 | `EUTHERGATE_WEB_ROOT` | `web/dist` | Built frontend directory. |
 | `EUTHERGATE_DESKTOP_OUTPUT` | `EUTHERGATE-1` | Name of the headless Hyprland output. |
 | `EUTHERGATE_DESKTOP_MODE` | `1280x720@30` | Virtual output resolution and frame rate. |

@@ -10,6 +10,12 @@ type Status = {
   auth_mode: "none" | "gate_cookie" | "eutheroxide_proxy";
 };
 
+type TerminalSessionInfo = {
+  name: string;
+  windows: number;
+  attached: number;
+};
+
 type DesktopStatus = {
   available: boolean;
   active: boolean;
@@ -112,6 +118,8 @@ const decoder = new TextDecoder();
 let socket: WebSocket | null = null;
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
+const terminalSessionPreferenceKey = "euthergate.terminal-session";
+let activeTerminalSession = loadTerminalSessionPreference();
 let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
@@ -277,6 +285,10 @@ function renderTerminal(): void {
           <h1>Forge terminal</h1>
         </div>
         <div class="actions">
+          <select id="terminal-session-picker" class="output-picker terminal-session-picker" aria-label="Terminal session">
+            <option value="${escapeHtml(activeTerminalSession)}">${escapeHtml(activeTerminalSession)}</option>
+          </select>
+          <button id="terminal-session-new" class="ghost-button" type="button">+ SESSION</button>
           <span id="socket-state" class="socket-state">CONNECTING</span>
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <button id="terminal-image-button" class="ghost-button" type="button">PASTE IMAGE</button>
@@ -285,7 +297,7 @@ function renderTerminal(): void {
         </div>
       </div>
       <div class="terminal-frame">
-        <div class="terminal-chrome"><span></span><span></span><span></span><b>euthergate://local/shell</b></div>
+        <div class="terminal-chrome"><span></span><span></span><span></span><b>euthergate://tmux/${escapeHtml(activeTerminalSession)}</b></div>
         <div id="terminal" aria-label="EutherGate terminal"></div>
       </div>
       <input id="terminal-image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
@@ -332,8 +344,83 @@ function renderTerminal(): void {
   document.querySelector<HTMLButtonElement>("#terminal-image-button")?.addEventListener("click", chooseTerminalImage);
   document.querySelector<HTMLInputElement>("#terminal-image-input")?.addEventListener("change", selectTerminalImage);
   document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
+  document.querySelector<HTMLSelectElement>("#terminal-session-picker")?.addEventListener("change", switchTerminalSession);
+  document.querySelector<HTMLButtonElement>("#terminal-session-new")?.addEventListener("click", createTerminalSession);
   bindCockpitNavigation();
+  void refreshTerminalSessions();
   connectSocket();
+}
+
+function loadTerminalSessionPreference(): string {
+  try {
+    const stored = window.localStorage.getItem(terminalSessionPreferenceKey) || "gate";
+    return /^[A-Za-z0-9_-]{1,32}$/.test(stored) ? stored : "gate";
+  } catch {
+    return "gate";
+  }
+}
+
+function saveTerminalSessionPreference(name: string): void {
+  activeTerminalSession = name;
+  try {
+    window.localStorage.setItem(terminalSessionPreferenceKey, name);
+  } catch {
+    // Private browsing may disable storage; the in-memory selection still works.
+  }
+}
+
+async function refreshTerminalSessions(): Promise<void> {
+  const picker = document.querySelector<HTMLSelectElement>("#terminal-session-picker");
+  if (!picker) return;
+  try {
+    const response = await fetch(gateUrl("api/terminal/sessions"));
+    const body = (await response.json()) as { sessions?: TerminalSessionInfo[]; error?: string };
+    if (!response.ok) throw new Error(body.error || "Could not list terminal sessions.");
+    const sessions = body.sessions || [];
+    if (!sessions.some((session) => session.name === activeTerminalSession)) {
+      sessions.unshift({ name: activeTerminalSession, windows: 1, attached: 0 });
+    }
+    picker.innerHTML = sessions.map((session) => {
+      const detail = `${session.windows}W${session.attached > 0 ? ` · ${session.attached}A` : ""}`;
+      return `<option value="${escapeHtml(session.name)}"${session.name === activeTerminalSession ? " selected" : ""}>${escapeHtml(session.name)} · ${detail}</option>`;
+    }).join("");
+  } catch (error) {
+    setSocketState("SESSION LIST FAILED");
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not list terminal sessions.", true);
+  }
+}
+
+function switchTerminalSession(event: Event): void {
+  const picker = event.currentTarget as HTMLSelectElement;
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(picker.value) || picker.value === activeTerminalSession) return;
+  saveTerminalSessionPreference(picker.value);
+  renderTerminal();
+}
+
+async function createTerminalSession(): Promise<void> {
+  const requested = window.prompt("Session name (letters, numbers, _ or -):", "work");
+  if (requested === null) return;
+  const name = requested.trim();
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) {
+    setTerminalImageStatus("Use 1-32 letters, numbers, underscores or dashes.", true);
+    return;
+  }
+  const button = document.querySelector<HTMLButtonElement>("#terminal-session-new");
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(gateUrl("api/terminal/sessions"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const body = (await response.json()) as { name?: string; error?: string };
+    if (!response.ok || !body.name) throw new Error(body.error || "Could not create terminal session.");
+    saveTerminalSessionPreference(body.name);
+    renderTerminal();
+  } catch (error) {
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not create terminal session.", true);
+    if (button) button.disabled = false;
+  }
 }
 
 function chooseTerminalImage(): void {
@@ -636,7 +723,9 @@ async function launchDesktopTerminal(): Promise<void> {
   const button = document.querySelector<HTMLButtonElement>("#desktop-terminal");
   if (button) button.disabled = true;
   try {
-    const response = await fetch(gateUrl("api/desktop/launch-terminal"), { method: "POST" });
+    const url = gateUrl("api/desktop/launch-terminal");
+    url.searchParams.set("session", activeTerminalSession);
+    const response = await fetch(url, { method: "POST" });
     const body = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(body.error || "Could not launch terminal.");
   } catch (error) {
@@ -1838,7 +1927,9 @@ async function logout(): Promise<void> {
 
 function connectSocket(): void {
   if (!terminal || !fitAddon) return;
-  socket = new WebSocket(gateWebSocket("ws/terminal"));
+  const url = gateWebSocket("ws/terminal");
+  url.searchParams.set("session", activeTerminalSession);
+  socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";
   setSocketState("CONNECTING");
 

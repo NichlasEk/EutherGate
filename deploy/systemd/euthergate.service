@@ -1,7 +1,7 @@
 [Unit]
 Description=EutherGate remote development gateway
-After=euthergate-forge.service
-Wants=euthergate-forge.service
+After=euthergate-forge.service euthergate-tmux.service
+Wants=euthergate-forge.service euthergate-tmux.service
 
 [Service]
 Type=simple

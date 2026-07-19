@@ -1,12 +1,12 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     io::{Read, Write},
     net::SocketAddr,
     os::unix::fs::MetadataExt,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -60,6 +60,7 @@ const DISPLAY_WAKE_HOLD_SECONDS: u64 = 120;
 const TURN_CREDENTIAL_TTL_SECONDS: u64 = 60 * 60;
 const FALLBACK_PACKET_HEADER_BYTES: usize = 5;
 const FALLBACK_MAX_PACKET_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_TERMINAL_SESSION: &str = "gate";
 
 #[derive(Clone)]
 struct AppState {
@@ -68,7 +69,7 @@ struct AppState {
     secure_cookie: bool,
     proxy_token_hash: Option<[u8; 32]>,
     turn: Option<Arc<TurnConfig>>,
-    terminal: Arc<TerminalSession>,
+    terminals: Arc<TerminalManager>,
     terminal_upload_dir: Arc<PathBuf>,
     desktop: Arc<DesktopManager>,
 }
@@ -78,6 +79,14 @@ struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     _child: StdMutex<Box<dyn portable_pty::Child + Send + Sync>>,
     output: Arc<OutputRelay>,
+}
+
+struct TerminalManager {
+    tmux: PathBuf,
+    socket_name: String,
+    shell: PathBuf,
+    workdir: PathBuf,
+    sessions: StdMutex<HashMap<String, Arc<TerminalSession>>>,
 }
 
 struct DesktopManager {
@@ -136,6 +145,23 @@ struct StatusResponse {
     authenticated: bool,
     terminal_ready: bool,
     auth_mode: &'static str,
+}
+
+#[derive(Clone, Serialize)]
+struct TerminalSessionInfo {
+    name: String,
+    windows: u32,
+    attached: u32,
+}
+
+#[derive(Deserialize)]
+struct TerminalSessionQuery {
+    session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateTerminalSessionRequest {
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -322,14 +348,19 @@ async fn main() -> Result<()> {
         println!("\n  EutherGate development token: {token}\n");
     }
 
-    let terminal = Arc::new(TerminalSession::spawn(&config.shell, &config.workdir)?);
+    let terminals = Arc::new(TerminalManager::new(
+        config.tmux.clone(),
+        config.tmux_socket.clone(),
+        config.shell.clone(),
+        config.workdir.clone(),
+    )?);
     let state = AppState {
         token_hash: hash_token(&config.token),
         auth_session: Arc::from(random_secret(32)),
         secure_cookie: config.secure_cookie,
         proxy_token_hash: config.proxy_token.as_deref().map(hash_token),
         turn: config.turn.clone().map(Arc::new),
-        terminal,
+        terminals,
         terminal_upload_dir: Arc::new(config.terminal_upload_dir.clone()),
         desktop: Arc::new(DesktopManager {
             transition: Mutex::new(()),
@@ -374,6 +405,10 @@ async fn main() -> Result<()> {
             "/api/terminal/image",
             post(terminal_image_upload).layer(DefaultBodyLimit::max(TERMINAL_IMAGE_LIMIT)),
         )
+        .route(
+            "/api/terminal/sessions",
+            get(terminal_sessions).post(terminal_session_create),
+        )
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -416,6 +451,8 @@ struct Config {
     turn: Option<TurnConfig>,
     shell: PathBuf,
     workdir: PathBuf,
+    tmux: PathBuf,
+    tmux_socket: String,
     web_root: PathBuf,
     desktop_output: String,
     desktop_mode: String,
@@ -483,6 +520,16 @@ impl Config {
         let workdir = env::var_os("EUTHERGATE_WORKDIR")
             .map(PathBuf::from)
             .unwrap_or(env::current_dir().context("could not determine current directory")?);
+        let tmux = env::var_os("EUTHERGATE_TMUX")
+            .map(PathBuf::from)
+            .map(|path| resolve_executable(&path))
+            .unwrap_or_else(|| resolve_executable(Path::new("tmux")))
+            .context("tmux is required for persistent terminal sessions")?;
+        let tmux_socket =
+            env::var("EUTHERGATE_TMUX_SOCKET").unwrap_or_else(|_| "euthergate".into());
+        if !valid_tmux_socket_name(&tmux_socket) {
+            anyhow::bail!("EUTHERGATE_TMUX_SOCKET must contain only letters, numbers, _ or -");
+        }
         let web_root = env::var_os("EUTHERGATE_WEB_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("web/dist"));
@@ -530,6 +577,8 @@ impl Config {
             turn,
             shell,
             workdir,
+            tmux,
+            tmux_socket,
             web_root,
             desktop_output,
             desktop_mode,
@@ -543,8 +592,109 @@ impl Config {
     }
 }
 
+impl TerminalManager {
+    fn new(tmux: PathBuf, socket_name: String, shell: PathBuf, workdir: PathBuf) -> Result<Self> {
+        let manager = Self {
+            tmux,
+            socket_name,
+            shell,
+            workdir,
+            sessions: StdMutex::new(HashMap::new()),
+        };
+        manager.ensure_tmux_session(DEFAULT_TERMINAL_SESSION)?;
+        Ok(manager)
+    }
+
+    fn ensure_tmux_session(&self, name: &str) -> Result<()> {
+        validate_terminal_session_name(name)?;
+        let target = format!("={name}");
+        let exists = StdCommand::new(&self.tmux)
+            .args(["-L", &self.socket_name, "has-session", "-t", &target])
+            .output()
+            .context("could not query tmux sessions")?
+            .status
+            .success();
+        if exists {
+            return Ok(());
+        }
+
+        let output = StdCommand::new(&self.tmux)
+            .args([
+                "-L",
+                &self.socket_name,
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-c",
+            ])
+            .arg(&self.workdir)
+            .arg(&self.shell)
+            .env("SHELL", &self.shell)
+            .output()
+            .context("could not create tmux session")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let raced = StdCommand::new(&self.tmux)
+            .args(["-L", &self.socket_name, "has-session", "-t", &target])
+            .output()
+            .context("could not recheck tmux session")?
+            .status
+            .success();
+        if raced {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "tmux could not create session {name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+
+    fn session(&self, name: &str) -> Result<Arc<TerminalSession>> {
+        self.ensure_tmux_session(name)?;
+        let mut sessions = self.sessions.lock().expect("terminal sessions poisoned");
+        if let Some(session) = sessions.get(name)
+            && session.is_alive()
+        {
+            return Ok(session.clone());
+        }
+        sessions.remove(name);
+        let session = Arc::new(TerminalSession::spawn_tmux(
+            &self.tmux,
+            &self.socket_name,
+            name,
+            &self.workdir,
+        )?);
+        sessions.insert(name.to_owned(), session.clone());
+        Ok(session)
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<TerminalSessionInfo>> {
+        let output = Command::new(&self.tmux)
+            .args([
+                "-L",
+                &self.socket_name,
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_windows}\t#{session_attached}",
+            ])
+            .output()
+            .await
+            .context("could not list tmux sessions")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux could not list sessions: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        parse_terminal_sessions(&String::from_utf8_lossy(&output.stdout))
+    }
+}
+
 impl TerminalSession {
-    fn spawn(shell: &PathBuf, workdir: &PathBuf) -> Result<Self> {
+    fn spawn_tmux(tmux: &Path, socket_name: &str, name: &str, workdir: &Path) -> Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
             .openpty(PtySize {
@@ -554,7 +704,9 @@ impl TerminalSession {
                 pixel_height: 0,
             })
             .context("could not create terminal PTY")?;
-        let mut command = CommandBuilder::new(shell);
+        let mut command = CommandBuilder::new(tmux);
+        command.args(["-L", socket_name, "attach-session", "-t"]);
+        command.arg(format!("={name}"));
         command.cwd(workdir);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
@@ -593,6 +745,14 @@ impl TerminalSession {
         Ok(session)
     }
 
+    fn is_alive(&self) -> bool {
+        self._child
+            .lock()
+            .expect("terminal child poisoned")
+            .try_wait()
+            .is_ok_and(|status| status.is_none())
+    }
+
     fn replay_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
         let _gate = self.output.gate.lock().expect("output gate poisoned");
         let replay = self
@@ -627,6 +787,22 @@ impl TerminalSession {
                 pixel_height: 0,
             })
             .context("could not resize PTY")
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let Ok(child) = self._child.get_mut() else {
+            return;
+        };
+        if child.try_wait().is_ok_and(|status| status.is_none()) {
+            // Stop the tmux client while its PTY is still open. Dropping the PTY
+            // first delivers a terminal hangup that can also tear down the tmux
+            // pane instead of merely detaching this gateway viewer.
+            if child.kill().is_ok() {
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -706,16 +882,85 @@ async fn logout() -> Response {
     response
 }
 
+async fn terminal_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.terminals.list_sessions().await {
+        Ok(sessions) => Json(serde_json::json!({ "sessions": sessions })).into_response(),
+        Err(error) => {
+            error!(%error, "could not list terminal sessions");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn terminal_session_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTerminalSessionRequest>,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Err(error) = validate_terminal_session_name(&request.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    match state.terminals.ensure_tmux_session(&request.name) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "name": request.name })),
+        )
+            .into_response(),
+        Err(error) => {
+            error!(%error, "could not create terminal session");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Query(query): Query<TerminalSessionQuery>,
     headers: HeaderMap,
 ) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.on_upgrade(move |socket| terminal_socket(socket, state.terminal))
-        .into_response()
+    let name = query.session.as_deref().unwrap_or(DEFAULT_TERMINAL_SESSION);
+    if let Err(error) = validate_terminal_session_name(name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    match state.terminals.session(name) {
+        Ok(terminal) => ws
+            .on_upgrade(move |socket| terminal_socket(socket, terminal))
+            .into_response(),
+        Err(error) => {
+            error!(%error, session = name, "could not attach terminal session");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn terminal_socket(socket: WebSocket, terminal: Arc<TerminalSession>) {
@@ -1002,11 +1247,34 @@ async fn desktop_start(
     }
 }
 
-async fn desktop_launch_terminal(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn desktop_launch_terminal(
+    State(state): State<AppState>,
+    Query(query): Query<TerminalSessionQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.desktop.launch_terminal().await {
+    let name = query.session.as_deref().unwrap_or(DEFAULT_TERMINAL_SESSION);
+    if let Err(error) = validate_terminal_session_name(name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(error) = state.terminals.ensure_tmux_session(name) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    match state
+        .desktop
+        .launch_terminal(&state.terminals.tmux, &state.terminals.socket_name, name)
+        .await
+    {
         Ok(workspace) => Json(serde_json::json!({ "workspace": workspace })).into_response(),
         Err(error) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1335,26 +1603,29 @@ impl DesktopManager {
         Ok(())
     }
 
-    async fn launch_terminal(&self) -> Result<u32> {
+    async fn launch_terminal(&self, tmux: &Path, tmux_socket: &str, session: &str) -> Result<u32> {
         if !self.active.load(Ordering::Acquire) {
             anyhow::bail!("start a desktop capture first");
         }
+        validate_terminal_session_name(session)?;
+        let terminal_command = format!(
+            "kitty --title {} {} -L {} attach-session -t ={}",
+            shell_quote(&format!("EutherGate-{session}")),
+            shell_quote(&tmux.display().to_string()),
+            tmux_socket,
+            session
+        );
         let selection = self.selection();
         match &selection.backend {
             DesktopBackend::Hyprland { signature, .. } => {
                 let monitors = hyprctl_instance(signature, &["monitors", "all", "-j"]).await?;
                 let workspace = monitor_workspace(&monitors, &selection.capture_output)?;
-                let rule =
-                    format!("[workspace {workspace} silent] kitty --title EutherGate-Remote-Forge");
+                let rule = format!("[workspace {workspace} silent] {terminal_command}");
                 hyprctl_instance(signature, &["dispatch", "exec", &rule]).await?;
                 Ok(workspace)
             }
             DesktopBackend::Sway { sway_socket, .. } => {
-                swayctl(
-                    sway_socket,
-                    &["exec", "kitty --title EutherGate-Remote-Forge"],
-                )
-                .await?;
+                swayctl(sway_socket, &["exec", &terminal_command]).await?;
                 Ok(selection.workspace)
             }
             DesktopBackend::Unavailable => anyhow::bail!("no Wayland session is available"),
@@ -2481,6 +2752,64 @@ fn env_bool(name: &str, default: bool) -> Result<bool> {
     }
 }
 
+fn valid_tmux_socket_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_terminal_session_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "terminal session names must be 1-32 letters, numbers, underscores or dashes"
+        );
+    }
+    Ok(())
+}
+
+fn parse_terminal_sessions(value: &str) -> Result<Vec<TerminalSessionInfo>> {
+    let mut sessions = Vec::new();
+    for line in value.lines() {
+        let mut fields = line.split('\t');
+        let Some(name) = fields.next() else { continue };
+        let Some(windows) = fields.next() else {
+            anyhow::bail!("tmux returned a malformed session row");
+        };
+        let Some(attached) = fields.next() else {
+            anyhow::bail!("tmux returned a malformed session row");
+        };
+        if validate_terminal_session_name(name).is_err() {
+            warn!(session = name, "ignored tmux session with unsupported name");
+            continue;
+        }
+        sessions.push(TerminalSessionInfo {
+            name: name.to_owned(),
+            windows: windows
+                .parse()
+                .context("tmux returned an invalid window count")?,
+            attached: attached
+                .parse()
+                .context("tmux returned an invalid attached-client count")?,
+        });
+    }
+    sessions.sort_by(|left, right| {
+        (left.name != DEFAULT_TERMINAL_SESSION, &left.name)
+            .cmp(&(right.name != DEFAULT_TERMINAL_SESSION, &right.name))
+    });
+    Ok(sessions)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn resolve_executable(path: &Path) -> Option<PathBuf> {
     if path.components().count() > 1 {
         return is_executable(path).then(|| path.to_path_buf());
@@ -2764,5 +3093,33 @@ mod tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o700
         );
+    }
+
+    #[test]
+    fn terminal_session_names_are_strictly_bounded() {
+        for valid in ["gate", "WaylandForge", "euther_drive-2"] {
+            assert!(validate_terminal_session_name(valid).is_ok());
+        }
+        for invalid in ["", "two words", "../escape", "name:window", "åäö"] {
+            assert!(validate_terminal_session_name(invalid).is_err());
+        }
+        assert!(validate_terminal_session_name(&"a".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn tmux_session_rows_are_parsed_and_gate_is_first() {
+        let sessions = parse_terminal_sessions("work\t2\t1\ngate\t1\t0\n").unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].name, "gate");
+        assert_eq!(sessions[0].windows, 1);
+        assert_eq!(sessions[1].name, "work");
+        assert_eq!(sessions[1].attached, 1);
+        assert!(parse_terminal_sessions("broken\trow\n").is_err());
+    }
+
+    #[test]
+    fn desktop_terminal_arguments_are_shell_quoted() {
+        assert_eq!(shell_quote("/usr/bin/tmux"), "'/usr/bin/tmux'");
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
     }
 }

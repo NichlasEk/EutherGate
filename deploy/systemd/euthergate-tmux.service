@@ -1,0 +1,12 @@
+[Unit]
+Description=EutherGate persistent tmux server
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tmux -D -L euthergate
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

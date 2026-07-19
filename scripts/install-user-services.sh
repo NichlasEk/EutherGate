@@ -5,10 +5,10 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 cd "$ROOT_DIR"
 
-for command in sway swaymsg wtype grim wl-copy wl-paste; do
+for command in sway swaymsg wtype grim wl-copy wl-paste tmux; do
     if ! command -v "$command" >/dev/null; then
         echo "Missing required Forge command: $command" >&2
-        echo "On Arch Linux: sudo pacman -S sway wtype grim wl-clipboard" >&2
+        echo "On Arch Linux: sudo pacman -S sway wtype grim wl-clipboard tmux" >&2
         exit 1
     fi
 done
@@ -36,8 +36,9 @@ install -d -m 700 "$UNIT_DIR"
 install -m 644 "$ROOT_DIR/deploy/systemd/euthergate.service" "$UNIT_DIR/euthergate.service"
 install -m 644 "$ROOT_DIR/deploy/systemd/euthergate-tunnel.service" "$UNIT_DIR/euthergate-tunnel.service"
 install -m 644 "$ROOT_DIR/deploy/systemd/euthergate-forge.service" "$UNIT_DIR/euthergate-forge.service"
+install -m 644 "$ROOT_DIR/deploy/systemd/euthergate-tmux.service" "$UNIT_DIR/euthergate-tmux.service"
 systemctl --user daemon-reload
-for unit in euthergate-forge.service euthergate.service euthergate-tunnel.service; do
+for unit in euthergate-forge.service euthergate-tmux.service euthergate.service euthergate-tunnel.service; do
     if ! systemctl --user is-enabled --quiet "$unit"; then
         systemctl --user enable "$unit"
     fi
@@ -46,6 +47,7 @@ done
 # Pick up updated binaries, scripts, and unit files even when an older version
 # of the services was already active before this installation.
 systemctl --user restart euthergate-forge.service
+systemctl --user start euthergate-tmux.service
 systemctl --user restart euthergate.service
 systemctl --user restart euthergate-tunnel.service
 

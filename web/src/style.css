@@ -498,6 +498,11 @@ body {
   background: var(--oxide-purple-hover);
 }
 
+.terminal-session-picker {
+  min-width: 150px;
+  max-width: 210px;
+}
+
 .primary-action {
   color: var(--acid);
   border-color: rgba(76, 165, 106, .35);

@@ -25,16 +25,23 @@ EutherGate gateway
     | authenticated cookie
     | bounded replay buffer
     v
-Persistent PTY + login shell
+PTY attachment
+    |
+    v
+Persistent named tmux session + login shell
 ```
 
-The gateway owns the terminal rather than the WebSocket. Closing or reloading a
-browser therefore only disconnects a viewer; it does not terminate the shell.
-On reconnection, the gateway sends recent buffered output before forwarding new
+The gateway owns each browser-facing PTY attachment rather than the WebSocket,
+while `euthergate-tmux.service` owns the underlying named sessions. Closing or
+reloading a browser therefore only disconnects a viewer, and restarting the
+gateway replaces its attachment without terminating programs in tmux. On
+reconnection, the gateway sends recent buffered output before forwarding new
 PTY output.
 
-Checkpoint 1 intentionally has one shared terminal per gateway process. It is a
-local-development vertical slice, not yet a multi-user security boundary.
+Each named session has one shared gateway attachment, so multiple authenticated
+browsers see and control the same terminal. Kitty can attach as a second tmux
+client. This is intentionally a single-user development surface, not a
+multi-user security boundary.
 
 ## Security boundary
 
