@@ -139,6 +139,7 @@ let desktopFallbackFrameUrl: string | null = null;
 let desktopNegotiationTimer: number | null = null;
 let desktopVncRetryTimer: number | null = null;
 let vncSuperHeld = false;
+let desktopSuperHeld = false;
 let desktopControlActive = false;
 let desktopIceCandidates: string[] = [];
 let desktopIceErrors: string[] = [];
@@ -613,7 +614,7 @@ async function renderDesktop(): Promise<void> {
         </div>
       </div>
       <div class="desktop-footer">
-        <span>Click to control · Keyboard opens mobile input · Esc returns locally · VNC: hold F8 for remote Super.</span>
+        <span>Click to control · Keyboard opens mobile input · Esc returns locally · Hold F8 for remote Super.</span>
         <span id="desktop-mode">1280×720 @ 30</span>
       </div>
       <div class="desktop-network" aria-live="polite">
@@ -1497,6 +1498,7 @@ function installDesktopInput(): void {
   }, { passive: false });
   window.addEventListener("keydown", desktopKeyEvent, { capture: true });
   window.addEventListener("keyup", desktopKeyEvent, { capture: true });
+  window.addEventListener("blur", releaseDesktopSuperKey);
   document.addEventListener("pointerlockchange", desktopPointerLockChange);
 }
 
@@ -1716,6 +1718,10 @@ function desktopKeyEvent(event: KeyboardEvent): void {
   if (activeElement === mobileInput && (!event.code || event.code === "Unidentified")) return;
   event.preventDefault();
   if (activeElement === mobileInput) event.stopImmediatePropagation();
+  if (!desktopVncActive && event.code === "F8") {
+    desktopSuperHeld = event.type === "keydown";
+    return;
+  }
   if (event.code === "Escape" && activeElement === frame) {
     if (event.type === "keydown") releaseDesktopControl();
     return;
@@ -1732,8 +1738,12 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     ctrl: event.ctrlKey,
     alt: event.altKey,
     shift: event.shiftKey,
-    meta: event.metaKey,
+    meta: event.metaKey || desktopSuperHeld,
   });
+}
+
+function releaseDesktopSuperKey(): void {
+  desktopSuperHeld = false;
 }
 
 function focusDesktopKeyboard(): void {
@@ -2063,6 +2073,7 @@ function disposeTerminal(): void {
 
 function disposeDesktop(): void {
   releaseVncSuperKey();
+  releaseDesktopSuperKey();
   window.removeEventListener("keydown", vncSuperKeyEvent, { capture: true });
   window.removeEventListener("keyup", vncSuperKeyEvent, { capture: true });
   window.removeEventListener("blur", releaseVncSuperKey);
@@ -2072,6 +2083,7 @@ function disposeDesktop(): void {
   remoteClipboardBlob = null;
   window.removeEventListener("keydown", desktopKeyEvent, { capture: true });
   window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
+  window.removeEventListener("blur", releaseDesktopSuperKey);
   document.removeEventListener("pointerlockchange", desktopPointerLockChange);
   inputChannel?.close();
   inputChannel = null;
