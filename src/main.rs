@@ -413,6 +413,7 @@ async fn main() -> Result<()> {
             "/api/terminal/sessions",
             get(terminal_sessions).post(terminal_session_create),
         )
+        .route("/api/terminal/local", post(terminal_local_create))
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -945,6 +946,36 @@ async fn terminal_session_create(
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn terminal_local_create(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let name = new_local_terminal_session_name();
+    if let Err(error) = state.terminals.ensure_tmux_session(&name) {
+        error!(%error, session = name, "could not create local terminal session");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    match state
+        .desktop
+        .launch_hyprland_terminal(&state.terminals.tmux, &state.terminals.socket_name, &name)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "name": name })).into_response(),
+        Err(error) => {
+            error!(%error, session = name, "could not launch local terminal window");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string(), "name": name })),
             )
                 .into_response()
         }
@@ -1650,6 +1681,29 @@ impl DesktopManager {
             }
             DesktopBackend::Unavailable => anyhow::bail!("no Wayland session is available"),
         }
+    }
+
+    async fn launch_hyprland_terminal(
+        &self,
+        tmux: &Path,
+        tmux_socket: &str,
+        session: &str,
+    ) -> Result<()> {
+        validate_terminal_session_name(session)?;
+        let instance = hypr_instances()
+            .await?
+            .into_iter()
+            .next()
+            .context("no logged-in Hyprland session is available")?;
+        let terminal_command = format!(
+            "kitty --title {} {} -L {} attach-session -t ={}",
+            shell_quote(&format!("EutherGate-{session}")),
+            shell_quote(&tmux.display().to_string()),
+            tmux_socket,
+            session
+        );
+        hyprctl_instance(&instance.instance, &["dispatch", "exec", &terminal_command]).await?;
+        Ok(())
     }
 
     async fn read_clipboard(&self) -> Result<Option<ClipboardPayload>> {
@@ -2638,6 +2692,14 @@ fn random_secret(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(random)
 }
 
+fn new_local_terminal_session_name() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("local-{timestamp}-{}", random_secret(4))
+}
+
 impl TurnConfig {
     fn ice_server(&self) -> Option<IceServer> {
         let expires = SystemTime::now()
@@ -3141,6 +3203,9 @@ mod tests {
             assert!(validate_terminal_session_name(invalid).is_err());
         }
         assert!(validate_terminal_session_name(&"a".repeat(33)).is_err());
+        let local = new_local_terminal_session_name();
+        assert!(local.starts_with("local-"));
+        assert!(validate_terminal_session_name(&local).is_ok());
     }
 
     #[test]

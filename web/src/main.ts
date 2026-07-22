@@ -295,6 +295,7 @@ function renderTerminal(): void {
             <option value="${escapeHtml(activeTerminalSession)}">${escapeHtml(activeTerminalSession)}</option>
           </select>
           <button id="terminal-session-new" class="ghost-button" type="button">+ SESSION</button>
+          <button id="terminal-local-new" class="ghost-button" type="button">OPEN TERMINAL</button>
           <span id="socket-state" class="socket-state">CONNECTING</span>
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <button id="terminal-image-button" class="ghost-button" type="button">PASTE IMAGE</button>
@@ -353,6 +354,7 @@ function renderTerminal(): void {
   document.querySelector<HTMLButtonElement>("#show-desktop")?.addEventListener("click", renderDesktop);
   document.querySelector<HTMLSelectElement>("#terminal-session-picker")?.addEventListener("change", switchTerminalSession);
   document.querySelector<HTMLButtonElement>("#terminal-session-new")?.addEventListener("click", createTerminalSession);
+  document.querySelector<HTMLButtonElement>("#terminal-local-new")?.addEventListener("click", openLocalTerminal);
   bindCockpitNavigation();
   void refreshTerminalSessions();
   terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
@@ -446,7 +448,11 @@ function renderTerminalSessionStrip(sessions: TerminalSessionInfo[]): void {
 
 function terminalSessionLabel(name: string): string {
   const local = /^local-\d{8}-(\d{2})(\d{2})\d{2}-\d+$/.exec(name);
-  return local ? `LOCAL ${local[1]}:${local[2]}` : name;
+  if (local) return `LOCAL ${local[1]}:${local[2]}`;
+  const generated = /^local-(\d{10})-[A-Za-z0-9_-]+$/.exec(name);
+  if (!generated) return name;
+  const created = new Date(Number(generated[1]) * 1000);
+  return `LOCAL ${created.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function terminalSessionPath(path: string): string {
@@ -493,6 +499,23 @@ async function createTerminalSession(): Promise<void> {
     renderTerminal();
   } catch (error) {
     setTerminalImageStatus(error instanceof Error ? error.message : "Could not create terminal session.", true);
+    if (button) button.disabled = false;
+  }
+}
+
+async function openLocalTerminal(): Promise<void> {
+  const button = document.querySelector<HTMLButtonElement>("#terminal-local-new");
+  if (button) button.disabled = true;
+  setTerminalImageStatus("Opening another tmux terminal on the Hyprland desktop…");
+  try {
+    const response = await fetch(gateUrl("api/terminal/local"), { method: "POST" });
+    const body = (await response.json()) as { name?: string; error?: string };
+    if (!response.ok || !body.name) throw new Error(body.error || "Could not open local terminal.");
+    await refreshTerminalSessions();
+    setTerminalImageStatus(`${terminalSessionLabel(body.name)} opened on the Hyprland desktop.`);
+  } catch (error) {
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not open local terminal.", true);
+  } finally {
     if (button) button.disabled = false;
   }
 }

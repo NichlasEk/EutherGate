@@ -111,6 +111,10 @@ same programs and terminal contents. From a local shell, the same server is
 available with `tmux -L euthergate list-sessions` and
 `tmux -L euthergate attach-session -t gate`.
 
+The terminal workspace also has **OPEN TERMINAL**. It creates a fresh named
+tmux session and opens a Kitty window for it on the logged-in Hyprland desktop,
+without requiring the remote desktop view or an active capture.
+
 The full media and input smoke test requires a running gateway and Forge
 session:
 
