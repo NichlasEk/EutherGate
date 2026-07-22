@@ -152,6 +152,10 @@ struct TerminalSessionInfo {
     name: String,
     windows: u32,
     attached: u32,
+    other_clients: u32,
+    activity: u64,
+    command: String,
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -672,13 +676,21 @@ impl TerminalManager {
     }
 
     async fn list_sessions(&self) -> Result<Vec<TerminalSessionInfo>> {
+        let gateway_sessions: Vec<String> = self
+            .sessions
+            .lock()
+            .expect("terminal sessions poisoned")
+            .iter()
+            .filter(|(_, session)| session.is_alive())
+            .map(|(name, _)| name.clone())
+            .collect();
         let output = Command::new(&self.tmux)
             .args([
                 "-L",
                 &self.socket_name,
                 "list-sessions",
                 "-F",
-                "#{session_name}\t#{session_windows}\t#{session_attached}",
+                "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_activity}\t#{pane_current_command}\t#{pane_current_path}",
             ])
             .output()
             .await
@@ -689,7 +701,15 @@ impl TerminalManager {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        parse_terminal_sessions(&String::from_utf8_lossy(&output.stdout))
+        let mut sessions = parse_terminal_sessions(&String::from_utf8_lossy(&output.stdout))?;
+        for session in &mut sessions {
+            if gateway_sessions.contains(&session.name) {
+                session.other_clients = session.attached.saturating_sub(1);
+            } else {
+                session.other_clients = session.attached;
+            }
+        }
+        Ok(sessions)
     }
 }
 
@@ -2777,12 +2797,21 @@ fn validate_terminal_session_name(value: &str) -> Result<()> {
 fn parse_terminal_sessions(value: &str) -> Result<Vec<TerminalSessionInfo>> {
     let mut sessions = Vec::new();
     for line in value.lines() {
-        let mut fields = line.split('\t');
+        let mut fields = line.splitn(6, '\t');
         let Some(name) = fields.next() else { continue };
         let Some(windows) = fields.next() else {
             anyhow::bail!("tmux returned a malformed session row");
         };
         let Some(attached) = fields.next() else {
+            anyhow::bail!("tmux returned a malformed session row");
+        };
+        let Some(activity) = fields.next() else {
+            anyhow::bail!("tmux returned a malformed session row");
+        };
+        let Some(command) = fields.next() else {
+            anyhow::bail!("tmux returned a malformed session row");
+        };
+        let Some(path) = fields.next() else {
             anyhow::bail!("tmux returned a malformed session row");
         };
         if validate_terminal_session_name(name).is_err() {
@@ -2797,6 +2826,14 @@ fn parse_terminal_sessions(value: &str) -> Result<Vec<TerminalSessionInfo>> {
             attached: attached
                 .parse()
                 .context("tmux returned an invalid attached-client count")?,
+            other_clients: attached
+                .parse()
+                .context("tmux returned an invalid attached-client count")?,
+            activity: activity
+                .parse()
+                .context("tmux returned an invalid session activity time")?,
+            command: command.to_owned(),
+            path: path.to_owned(),
         });
     }
     sessions.sort_by(|left, right| {
@@ -3108,12 +3145,18 @@ mod tests {
 
     #[test]
     fn tmux_session_rows_are_parsed_and_gate_is_first() {
-        let sessions = parse_terminal_sessions("work\t2\t1\ngate\t1\t0\n").unwrap();
+        let sessions = parse_terminal_sessions(
+            "work\t2\t1\t1720000000\tcargo\t/home/nichlas/work\ngate\t1\t0\t1720000001\tcodex\t/home/nichlas/EutherGate\n",
+        )
+        .unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "gate");
         assert_eq!(sessions[0].windows, 1);
+        assert_eq!(sessions[0].command, "codex");
         assert_eq!(sessions[1].name, "work");
         assert_eq!(sessions[1].attached, 1);
+        assert_eq!(sessions[1].other_clients, 1);
+        assert_eq!(sessions[1].path, "/home/nichlas/work");
         assert!(parse_terminal_sessions("broken\trow\n").is_err());
     }
 

@@ -14,6 +14,10 @@ type TerminalSessionInfo = {
   name: string;
   windows: number;
   attached: number;
+  other_clients: number;
+  activity: number;
+  command: string;
+  path: string;
 };
 
 type DesktopStatus = {
@@ -120,6 +124,7 @@ let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 const terminalSessionPreferenceKey = "euthergate.terminal-session";
 let activeTerminalSession = loadTerminalSessionPreference();
+let terminalSessionRefreshTimer: number | null = null;
 let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
 let remoteCandidates: RTCIceCandidateInit[] = [];
@@ -296,6 +301,7 @@ function renderTerminal(): void {
           ${proxiedSession ? "" : '<button id="logout" class="ghost-button" type="button">CLOSE GATE</button>'}
         </div>
       </div>
+      <div id="terminal-session-strip" class="terminal-session-strip" aria-label="Open terminal sessions"></div>
       <div class="terminal-frame">
         <div class="terminal-chrome"><span></span><span></span><span></span><b>euthergate://tmux/${escapeHtml(activeTerminalSession)}</b></div>
         <div id="terminal" aria-label="EutherGate terminal"></div>
@@ -348,6 +354,7 @@ function renderTerminal(): void {
   document.querySelector<HTMLButtonElement>("#terminal-session-new")?.addEventListener("click", createTerminalSession);
   bindCockpitNavigation();
   void refreshTerminalSessions();
+  terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
   connectSocket();
 }
 
@@ -376,24 +383,90 @@ async function refreshTerminalSessions(): Promise<void> {
     const response = await fetch(gateUrl("api/terminal/sessions"));
     const body = (await response.json()) as { sessions?: TerminalSessionInfo[]; error?: string };
     if (!response.ok) throw new Error(body.error || "Could not list terminal sessions.");
-    const sessions = body.sessions || [];
+    const sessions = (body.sessions || []).sort((left, right) => {
+      if (left.name === "gate") return -1;
+      if (right.name === "gate") return 1;
+      return right.activity - left.activity || left.name.localeCompare(right.name);
+    });
     if (!sessions.some((session) => session.name === activeTerminalSession)) {
-      sessions.unshift({ name: activeTerminalSession, windows: 1, attached: 0 });
+      sessions.unshift({
+        name: activeTerminalSession,
+        windows: 1,
+        attached: 0,
+        other_clients: 0,
+        activity: 0,
+        command: "shell",
+        path: "",
+      });
     }
     picker.innerHTML = sessions.map((session) => {
       const detail = `${session.windows}W${session.attached > 0 ? ` · ${session.attached}A` : ""}`;
       return `<option value="${escapeHtml(session.name)}"${session.name === activeTerminalSession ? " selected" : ""}>${escapeHtml(session.name)} · ${detail}</option>`;
     }).join("");
+    renderTerminalSessionStrip(sessions);
   } catch (error) {
     setSocketState("SESSION LIST FAILED");
     setTerminalImageStatus(error instanceof Error ? error.message : "Could not list terminal sessions.", true);
   }
 }
 
+function renderTerminalSessionStrip(sessions: TerminalSessionInfo[]): void {
+  const strip = document.querySelector<HTMLDivElement>("#terminal-session-strip");
+  if (!strip) return;
+  const now = Math.floor(Date.now() / 1000);
+  strip.innerHTML = sessions.map((session) => {
+    const active = session.name === activeTerminalSession;
+    const recent = session.activity > 0 && now - session.activity < 15;
+    const context = terminalSessionPath(session.path);
+    const clients = session.other_clients > 0
+      ? `${session.other_clients} LOCAL`
+      : `${session.windows}W`;
+    const title = [session.name, session.command, session.path, `${session.windows} windows`, `${session.other_clients} other clients`]
+      .filter(Boolean)
+      .join(" · ");
+    return `
+      <button class="terminal-session-chip${active ? " is-active" : ""}${recent ? " is-recent" : ""}"
+        type="button" data-terminal-session="${escapeHtml(session.name)}" aria-pressed="${active}" title="${escapeHtml(title)}">
+        <span class="terminal-session-chip-top">
+          <i aria-hidden="true"></i>
+          <strong>${escapeHtml(terminalSessionLabel(session.name))}</strong>
+          <small>${escapeHtml(clients)}</small>
+        </span>
+        <span class="terminal-session-chip-detail">
+          <b>${escapeHtml(session.command || "shell")}</b>
+          ${context ? `<em>${escapeHtml(context)}</em>` : ""}
+        </span>
+      </button>`;
+  }).join("");
+  strip.querySelectorAll<HTMLButtonElement>("[data-terminal-session]").forEach((button) => {
+    button.addEventListener("click", () => switchToTerminalSession(button.dataset.terminalSession || ""));
+  });
+}
+
+function terminalSessionLabel(name: string): string {
+  const local = /^local-\d{8}-(\d{2})(\d{2})\d{2}-\d+$/.exec(name);
+  return local ? `LOCAL ${local[1]}:${local[2]}` : name;
+}
+
+function terminalSessionPath(path: string): string {
+  const homePath = path.replace(/^\/home\/[^/]+(?=\/|$)/, "~");
+  if (homePath === "~") return "~";
+  if (homePath.startsWith("~/")) {
+    const homeParts = homePath.slice(2).split("/").filter(Boolean);
+    return `~/${homeParts.slice(-2).join("/")}`;
+  }
+  const parts = homePath.split("/").filter(Boolean);
+  return parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : homePath;
+}
+
 function switchTerminalSession(event: Event): void {
   const picker = event.currentTarget as HTMLSelectElement;
-  if (!/^[A-Za-z0-9_-]{1,32}$/.test(picker.value) || picker.value === activeTerminalSession) return;
-  saveTerminalSessionPreference(picker.value);
+  switchToTerminalSession(picker.value);
+}
+
+function switchToTerminalSession(name: string): void {
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name) || name === activeTerminalSession) return;
+  saveTerminalSessionPreference(name);
   renderTerminal();
 }
 
@@ -1978,6 +2051,8 @@ function disposeViews(): void {
 }
 
 function disposeTerminal(): void {
+  if (terminalSessionRefreshTimer !== null) window.clearInterval(terminalSessionRefreshTimer);
+  terminalSessionRefreshTimer = null;
   window.removeEventListener("resize", fitTerminal);
   socket?.close();
   socket = null;
