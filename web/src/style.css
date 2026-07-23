@@ -128,6 +128,15 @@ h1 { margin: 18px 0 12px; color: #f0f4f1; font-size: clamp(46px, 8vw, 92px); lin
   min-width: 1px; min-height: 1px; padding: 0; border: 0; opacity: 0; resize: none;
   pointer-events: none;
 }
+.browser-frame .desktop-mobile-input:focus {
+  left: 50%; bottom: 34px; z-index: 12; width: min(460px, calc(100% - 32px)); height: 42px;
+  min-height: 42px; padding: 10px 14px; border: 1px solid var(--acid); border-radius: 7px;
+  outline: none; opacity: .96; resize: none; pointer-events: auto;
+  transform: translateX(-50%); color: #f3ffd5; background: rgba(8, 14, 10, .96);
+  box-shadow: 0 0 0 2px rgba(199, 255, 74, .15), 0 10px 34px rgba(0, 0, 0, .55);
+  font: 13px "Space Mono", monospace;
+}
+.browser-frame .desktop-mobile-input:focus::placeholder { color: #91aa76; opacity: 1; }
 .desktop-frame video,
 .desktop-frame > img,
 .desktop-frame > #desktop-vnc { width: 100%; height: 100%; display: block; object-fit: contain; background: #050608; }

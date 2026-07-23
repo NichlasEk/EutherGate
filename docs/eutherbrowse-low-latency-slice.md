@@ -42,6 +42,14 @@ character. The persistent process pays the attachment delay once. Standalone
 special-key invocations use the same 100 ms startup barrier already used by
 EutherBrowse URL navigation.
 
+While an EutherBrowse stream is live, its hardware-keyboard listener remains
+active for the whole browser view. It does not depend on the stream wrapper
+remaining `document.activeElement` after a remote click or image refresh.
+The `KEYBOARD` action also exposes a small `TYPE HERE → FIREFOX` field that uses
+ordinary browser input events as an explicit fallback. Gate acknowledges only
+the input event type, never its text; the UI shows `KEYBOARD ACTIVE` without
+logging an email address or password.
+
 ## Verification
 
 The lifecycle smoke test now proves that a second JPEG cannot arrive before the

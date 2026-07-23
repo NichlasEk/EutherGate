@@ -149,6 +149,14 @@ class WssDesktopBridge:
                         controller.flush_pointer()
                     else:
                         controller.inject(event)
+                        if event.get("type") == "text" or (
+                            event.get("type") == "key"
+                            and event.get("state") == "pressed"
+                            and not event.get("repeat")
+                        ):
+                            self.emit_json(
+                                {"type": "input-ack", "input": event.get("type")}
+                            )
                 except queue.Empty:
                     continue
                 except Exception as error:

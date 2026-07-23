@@ -16,6 +16,7 @@ OUTPUT = os.environ.get("EUTHERGATE_SMOKE_OUTPUT", "")
 CLICK = os.environ.get("EUTHERGATE_SMOKE_CLICK") == "1"
 POINTER_X = int(os.environ.get("EUTHERGATE_SMOKE_X", "100"))
 POINTER_Y = int(os.environ.get("EUTHERGATE_SMOKE_Y", "100"))
+TEXT = os.environ.get("EUTHERGATE_SMOKE_TEXT", "")
 
 
 def login() -> str:
@@ -66,6 +67,21 @@ def main() -> int:
             socket.send(json.dumps({"type": "frame_ack"}))
             break
     socket.send(json.dumps({"type": "pointer_move", "x": POINTER_X, "y": POINTER_Y}))
+    input_ack = not TEXT
+    if TEXT:
+        socket.send(json.dumps({"type": "text", "text": TEXT}))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            payload = socket.recv(timeout=max(0.1, deadline - time.monotonic()))
+            if isinstance(payload, bytes) and payload.startswith(b"\xff\xd8"):
+                socket.send(json.dumps({"type": "frame_ack"}))
+            elif isinstance(payload, str):
+                message = json.loads(payload)
+                if message.get("type") == "input-ack" and message.get("input") == "text":
+                    input_ack = True
+                    break
+        if not input_ack:
+            raise RuntimeError("HTTPS/WSS helper did not acknowledge text input")
     if CLICK:
         socket.send(json.dumps({"type": "pointer_button", "button": 0, "state": "pressed"}))
         time.sleep(0.05)
@@ -76,7 +92,12 @@ def main() -> int:
         raise RuntimeError("HTTPS/WSS helper did not announce readiness")
     if not frame:
         raise RuntimeError("no complete JPEG desktop frame arrived")
-    input_result = "real pointer click sent" if CLICK else "input socket writable"
+    if TEXT:
+        input_result = "text input acknowledged"
+    elif CLICK:
+        input_result = "real pointer click sent"
+    else:
+        input_result = "input socket writable"
     print(f"ok: HTTPS/WSS JPEG frame received ({len(frame)} bytes), {input_result}")
     return 0
 

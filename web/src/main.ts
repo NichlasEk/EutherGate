@@ -711,6 +711,7 @@ async function renderBrowser(id: number): Promise<void> {
         <div id="desktop-vnc" hidden></div>
         <textarea id="desktop-mobile-input" class="desktop-mobile-input" rows="1" inputmode="text"
           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+          placeholder="TYPE HERE → FIREFOX"
           aria-label="Mobile keyboard input for home Firefox"></textarea>
         <div id="desktop-local-cursor" class="desktop-local-cursor" aria-hidden="true" hidden></div>
         <div class="desktop-touch-hint">TAP = CLICK · DRAG = POINTER · PINCH = ZOOM</div>
@@ -1533,6 +1534,8 @@ function connectFallbackDesktop(attempt = 0): void {
     } else if (message.type === "error" || message.type === "fatal") {
       showDesktopMessage(String(message.message || "HTTPS/WSS desktop failure"));
       setDesktopState("FAULT");
+    } else if (message.type === "input-ack") {
+      setDesktopState("KEYBOARD ACTIVE");
     } else if (message.type === "capture-warning" || message.type === "input-warning") {
       console.warn("EutherGate HTTPS/WSS desktop:", message.message);
     }
@@ -2124,9 +2127,15 @@ function desktopKeyEvent(event: KeyboardEvent): void {
   const frame = document.querySelector<HTMLDivElement>("#desktop-frame");
   const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
   const activeElement = document.activeElement;
-  if (!frame || (activeElement !== frame && activeElement !== mobileInput)) return;
+  const browserCapture = activeBrowserSessionId !== null && desktopVideoReady;
+  if (!frame || (!browserCapture && activeElement !== frame && activeElement !== mobileInput)) return;
   if (desktopVncActive && activeElement !== mobileInput) return;
   if (activeElement === mobileInput && (!event.code || event.code === "Unidentified")) return;
+  const altGraphText = event.getModifierState("AltGraph") || (event.ctrlKey && event.altKey);
+  const printableText = event.key.length === 1
+    && !event.metaKey
+    && ((!event.ctrlKey && !event.altKey) || altGraphText);
+  if (!desktopVncActive && activeElement === mobileInput && printableText) return;
   event.preventDefault();
   if (activeElement === mobileInput) event.stopImmediatePropagation();
   if (!desktopVncActive && event.code === "F8") {
@@ -2137,10 +2146,6 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     if (event.type === "keydown") releaseDesktopControl();
     return;
   }
-  const altGraphText = event.getModifierState("AltGraph") || (event.ctrlKey && event.altKey);
-  const printableText = event.key.length === 1
-    && !event.metaKey
-    && ((!event.ctrlKey && !event.altKey) || altGraphText);
   if (!desktopVncActive && printableText) {
     if (event.type === "keydown" && !event.isComposing) sendDesktopText(event.key);
     return;
@@ -2171,7 +2176,7 @@ function focusDesktopKeyboard(): void {
   if (document.pointerLockElement) document.exitPointerLock();
   input.value = "";
   input.focus({ preventScroll: true });
-  setDesktopState("MOBILE KEYBOARD");
+  setDesktopState("TYPE TO FIREFOX");
 }
 
 function desktopMobileInput(event: Event): void {
