@@ -2297,7 +2297,7 @@ impl BrowserManager {
             &self.start_url,
         ]);
         let command = format!(
-            "env MOZ_ENABLE_WAYLAND=1 {} {}",
+            "env MOZ_ENABLE_WAYLAND=1 MOZ_WEBRENDER=1 {} {}",
             shell_quote(&firefox.display().to_string()),
             arguments
                 .iter()
@@ -2599,6 +2599,8 @@ user_pref("browser.startup.page", 0);
 user_pref("browser.tabs.warnOnClose", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
 user_pref("extensions.enabledScopes", 1);
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.software", true);
 user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
 "#,
     )

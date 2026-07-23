@@ -75,6 +75,15 @@ one coalesced Sway repaint is requested every 900 ms; leaving EutherBrowse or
 letting the window expire stops the timer. The fullscreen disable/enable pair is
 sent in one Sway IPC command to avoid spawning two helper processes per pulse.
 
+Firefox 152 on the virtual pixman output otherwise blocklists both hardware
+compositing and ordinary WebRender and falls back to Basic compositing. Live
+measurement showed ChatGPT's message controls updating while newly streamed
+Markdown remained blank in that mode. EutherBrowse therefore enables Firefox's
+CPU-backed software WebRender (`SWGL`) in its private profile and launch
+environment. An isolated profile was verified through `about:support` as
+`Compositing: WebRender (Software)` before enabling it for the persistent
+profile.
+
 ## Verification
 
 The lifecycle smoke test now proves that a second JPEG cannot arrive before the
