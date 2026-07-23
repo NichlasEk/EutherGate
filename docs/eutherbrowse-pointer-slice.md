@@ -21,12 +21,17 @@ button state and the target coordinate reached Firefox as one pointer stream.
 - The helper releases every held button before disconnecting.
 - The web view captures a mouse pointer from down through up, tracks held
   buttons, and releases them on cancellation, blur or view disposal.
+- Browser-mode movement is forwarded as soon as the local pointer enters the
+  frame. It no longer waits for a first click while only the lime overlay moves.
 - Each Firefox session chip has its own small close button. It closes exactly
   that Firefox window without first activating it.
 - Closing the active Firefox window is transactional: Gate first confirms the
   exact window was closed, then releases the viewer and opens the next session.
   A failed close leaves the existing viewer connected and usable instead of
   replacing it with a dead error screen.
+- The browser UI closes windows through a POST action endpoint. The older DELETE
+  endpoint remains available, but POST also works through restrictive workplace
+  reverse proxies that reject or drop DELETE requests.
 - The WSS smoke test can opt into a real click and explicit coordinates with
   `EUTHERGATE_SMOKE_CLICK=1`, `EUTHERGATE_SMOKE_X` and
   `EUTHERGATE_SMOKE_Y`.

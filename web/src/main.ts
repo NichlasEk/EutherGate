@@ -644,7 +644,7 @@ async function closeActiveBrowserSession(): Promise<void> {
   buttons.forEach((button) => { button.disabled = true; });
   setDesktopState("CLOSING");
   try {
-    const response = await fetch(gateUrl(`api/browser/sessions/${id}`), { method: "DELETE" });
+    const response = await fetch(gateUrl(`api/browser/sessions/${id}/close`), { method: "POST" });
     if (response.status === 401) return renderLogin("Your gate session expired.");
     if (!response.ok) throw new Error(await responseError(response, "Could not close Firefox window."));
   } catch (error) {
@@ -676,7 +676,7 @@ async function closeBrowserSession(id: number, button: HTMLButtonElement): Promi
   }
   button.disabled = true;
   try {
-    const response = await fetch(gateUrl(`api/browser/sessions/${id}`), { method: "DELETE" });
+    const response = await fetch(gateUrl(`api/browser/sessions/${id}/close`), { method: "POST" });
     if (response.status === 401) return renderLogin("Your gate session expired.");
     if (!response.ok) throw new Error(await responseError(response, "Could not close Firefox window."));
     await refreshTerminalSessions();
@@ -1771,7 +1771,10 @@ function installDesktopInput(): void {
       desktopTouchMove(frame, event);
       return;
     }
-    if (!desktopControlActive) return;
+    if (!desktopControlActive) {
+      if (activeBrowserSessionId === null) return;
+      desktopControlActive = true;
+    }
     if (document.pointerLockElement === frame) {
       sendDesktopInput({ type: "pointer_delta", dx: event.movementX, dy: event.movementY });
       return;

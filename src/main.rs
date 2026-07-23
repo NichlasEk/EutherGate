@@ -485,6 +485,10 @@ async fn main() -> Result<()> {
             "/api/browser/sessions/{id}",
             axum::routing::delete(browser_session_close),
         )
+        .route(
+            "/api/browser/sessions/{id}/close",
+            post(browser_session_close),
+        )
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
