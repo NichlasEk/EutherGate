@@ -126,7 +126,8 @@ const app: HTMLDivElement = appNode;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-let socket: WebSocket | null = null;
+let terminalSocket: WebSocket | null = null;
+let desktopSocket: WebSocket | null = null;
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 const terminalSessionPreferenceKey = "euthergate.terminal-session";
@@ -146,6 +147,8 @@ let vnc: RFB | null = null;
 let desktopFallbackFrameUrl: string | null = null;
 let desktopNegotiationTimer: number | null = null;
 let desktopVncRetryTimer: number | null = null;
+let desktopFallbackRetryTimer: number | null = null;
+let desktopHeartbeatTimer: number | null = null;
 let vncSuperHeld = false;
 let desktopSuperHeld = false;
 let desktopControlActive = false;
@@ -357,7 +360,7 @@ function renderTerminal(): void {
   terminalNode.addEventListener("drop", dropImageIntoTerminal);
 
   terminal.onData((data) => {
-    if (socket?.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
+    if (terminalSocket?.readyState === WebSocket.OPEN) terminalSocket.send(encoder.encode(data));
   });
   terminal.onResize(sendResize);
   window.addEventListener("resize", fitTerminal);
@@ -369,7 +372,7 @@ function renderTerminal(): void {
   document.querySelector<HTMLSelectElement>("#terminal-session-picker")?.addEventListener("change", switchTerminalSession);
   document.querySelector<HTMLButtonElement>("#terminal-session-new")?.addEventListener("click", createTerminalSession);
   document.querySelector<HTMLButtonElement>("#terminal-local-new")?.addEventListener("click", openLocalTerminal);
-  document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", createBrowserSession);
+  document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", openOrShowBrowser);
   bindCockpitNavigation();
   void refreshTerminalSessions();
   terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
@@ -620,6 +623,31 @@ async function createBrowserSession(): Promise<void> {
   }
 }
 
+async function closeActiveBrowserSession(): Promise<void> {
+  const id = activeBrowserSessionId;
+  if (id === null) return;
+  const button = document.querySelector<HTMLButtonElement>("#browser-close");
+  if (button) button.disabled = true;
+  setDesktopState("CLOSING");
+  disposeDesktop();
+  try {
+    await waitForDesktopViewerRelease();
+    const response = await fetch(gateUrl(`api/browser/sessions/${id}`), { method: "DELETE" });
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    if (!response.ok) throw new Error(await responseError(response, "Could not close Firefox window."));
+    activeBrowserSessionId = null;
+    const sessionsResponse = await fetch(gateUrl("api/browser/sessions"));
+    const body = (await sessionsResponse.json()) as { sessions?: BrowserSessionInfo[] };
+    const next = body.sessions?.[0];
+    if (sessionsResponse.ok && next) await renderBrowser(next.id);
+    else renderTerminal();
+  } catch (error) {
+    setDesktopState("CLOSE FAILED");
+    showDesktopMessage(error instanceof Error ? error.message : "Could not close Firefox window.");
+    if (button) button.disabled = false;
+  }
+}
+
 async function renderBrowser(id: number): Promise<void> {
   disposeViews();
   activeBrowserSessionId = id;
@@ -631,7 +659,8 @@ async function renderBrowser(id: number): Promise<void> {
           <h1>EutherBrowse</h1>
         </div>
         <div class="actions">
-          <button id="browser-new" class="ghost-button" type="button">OPEN BROWSER</button>
+          <button id="browser-new" class="ghost-button" type="button">NEW WINDOW</button>
+          <button id="browser-close" class="ghost-button" type="button">CLOSE WINDOW</button>
           <span id="desktop-state" class="socket-state">FOCUSING</span>
           <button id="desktop-keyboard" class="ghost-button primary-action" type="button">KEYBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
@@ -645,6 +674,7 @@ async function renderBrowser(id: number): Promise<void> {
         <textarea id="desktop-mobile-input" class="desktop-mobile-input" rows="1" inputmode="text"
           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
           aria-label="Mobile keyboard input for home Firefox"></textarea>
+        <div id="desktop-local-cursor" class="desktop-local-cursor" aria-hidden="true" hidden></div>
         <div class="desktop-touch-hint">TAP = CLICK · DRAG = POINTER · PINCH = ZOOM</div>
         <button id="desktop-zoom-reset" class="desktop-zoom-reset" type="button" hidden>VIEW 100%</button>
         <div class="desktop-empty" id="desktop-empty">
@@ -664,6 +694,7 @@ async function renderBrowser(id: number): Promise<void> {
     </section>`, "browser");
 
   document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", createBrowserSession);
+  document.querySelector<HTMLButtonElement>("#browser-close")?.addEventListener("click", closeActiveBrowserSession);
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-keyboard")?.addEventListener("click", focusDesktopKeyboard);
   const zoomReset = document.querySelector<HTMLButtonElement>("#desktop-zoom-reset");
@@ -675,6 +706,7 @@ async function renderBrowser(id: number): Promise<void> {
   terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
 
   try {
+    await waitForDesktopViewerRelease();
     const focusResponse = await fetch(gateUrl(`api/browser/sessions/${id}/focus`), { method: "POST" });
     const session = (await focusResponse.json()) as BrowserSessionInfo & { error?: string };
     if (focusResponse.status === 401) return renderLogin("Your gate session expired.");
@@ -834,6 +866,7 @@ async function renderDesktop(): Promise<void> {
   installDesktopInput();
 
   try {
+    await waitForDesktopViewerRelease();
     const response = await fetch(gateUrl("api/desktop/status"));
     if (response.status === 401) return renderLogin("Your gate session expired.");
     if (!response.ok) throw new Error("Desktop service did not answer.");
@@ -937,8 +970,8 @@ async function switchDesktopOutput(): Promise<void> {
   picker.disabled = true;
   setDesktopState("SWITCHING");
   disposeDesktop();
-  await new Promise((resolve) => window.setTimeout(resolve, 250));
   try {
+    await waitForDesktopViewerRelease();
     const response = await fetch(gateUrl(`api/desktop/start?output=${encodeURIComponent(picker.value)}`), { method: "POST" });
     const body = (await response.json()) as { error?: string };
     if (!response.ok) throw new Error(body.error || "Output switch failed.");
@@ -966,8 +999,13 @@ async function switchDesktopTransport(): Promise<void> {
   picker.disabled = true;
   setDesktopState("CHANGING PROTOCOL");
   disposeDesktop();
-  await new Promise((resolve) => window.setTimeout(resolve, 250));
-  connectDesktop();
+  try {
+    await waitForDesktopViewerRelease();
+    connectDesktop();
+  } catch (error) {
+    setDesktopState("VIEWER BUSY");
+    showDesktopMessage(error instanceof Error ? error.message : "Another desktop viewer is still active.");
+  }
   picker.disabled = false;
 }
 
@@ -982,9 +1020,37 @@ async function switchVncPerformanceProfile(): Promise<void> {
   picker.disabled = true;
   setDesktopState("CHANGING VNC PROFILE");
   disposeDesktop();
-  await new Promise((resolve) => window.setTimeout(resolve, 250));
-  connectVncDesktop();
+  try {
+    await waitForDesktopViewerRelease();
+    connectVncDesktop();
+  } catch (error) {
+    setDesktopState("VIEWER BUSY");
+    showDesktopMessage(error instanceof Error ? error.message : "Another desktop viewer is still active.");
+  }
   picker.disabled = false;
+}
+
+async function waitForDesktopViewerRelease(timeoutMs = 23000): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  let waiting = false;
+  while (true) {
+    const response = await fetch(gateUrl("api/desktop/status"), { cache: "no-store" });
+    if (response.status === 401) {
+      renderLogin("Your gate session expired.");
+      throw new Error("Your gate session expired.");
+    }
+    if (!response.ok) throw new Error("Could not verify desktop viewer state.");
+    const status = (await response.json()) as DesktopStatus;
+    if (!status.viewer_connected) return;
+    if (!waiting) {
+      waiting = true;
+      setDesktopState("WAITING FOR VIEWER RELEASE");
+    }
+    if (performance.now() >= deadline) {
+      throw new Error("Another desktop or browser viewer is still active. Close that view and try again.");
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
 }
 
 async function launchDesktopTerminal(): Promise<void> {
@@ -1219,7 +1285,8 @@ function connectDesktop(): void {
     return;
   }
 
-  socket = new WebSocket(gateWebSocket("ws/desktop"));
+  const signalingSocket = new WebSocket(gateWebSocket("ws/desktop"));
+  desktopSocket = signalingSocket;
   setDesktopState("NEGOTIATING");
   activeDesktopIceServers = iceServersForProfile(profile);
   peer = new RTCPeerConnection({
@@ -1249,8 +1316,8 @@ function connectDesktop(): void {
       if (!desktopIceCandidates.includes(summary)) desktopIceCandidates.push(summary);
       updateIceDiagnostics();
     }
-    if (event.candidate && socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ type: "ice", ...event.candidate.toJSON() }));
+    if (event.candidate && desktopSocket === signalingSocket && signalingSocket.readyState === WebSocket.OPEN) {
+      signalingSocket.send(JSON.stringify({ type: "ice", ...event.candidate.toJSON() }));
     }
   });
   peer.addEventListener("icecandidateerror", (event) => {
@@ -1276,11 +1343,11 @@ function connectDesktop(): void {
     setDesktopState(`ICE ${peer.iceConnectionState.toUpperCase()}`);
   });
 
-  socket.addEventListener("open", async () => {
-    if (!peer || socket?.readyState !== WebSocket.OPEN) return;
+  signalingSocket.addEventListener("open", async () => {
+    if (!peer || desktopSocket !== signalingSocket || signalingSocket.readyState !== WebSocket.OPEN) return;
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
-    socket.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
+    signalingSocket.send(JSON.stringify({ type: "offer", sdp: offer.sdp }));
     desktopNegotiationTimer = window.setTimeout(() => {
       if (!desktopVideoReady) {
         const rtcState = peer?.connectionState || "unknown";
@@ -1291,7 +1358,8 @@ function connectDesktop(): void {
       }
     }, 8000);
   });
-  socket.addEventListener("message", async (event) => {
+  signalingSocket.addEventListener("message", async (event) => {
+    if (desktopSocket !== signalingSocket) return;
     const message = JSON.parse(String(event.data)) as Record<string, unknown>;
     if (message.type === "ready") {
       const transport = document.querySelector<HTMLElement>("#desktop-transport");
@@ -1311,8 +1379,8 @@ function connectDesktop(): void {
       console.warn("EutherGate desktop:", message.message);
     }
   });
-  socket.addEventListener("close", () => {
-    if (peer) setDesktopState("DISCONNECTED");
+  signalingSocket.addEventListener("close", () => {
+    if (desktopSocket === signalingSocket && peer) setDesktopState("DISCONNECTED");
   });
 }
 
@@ -1384,7 +1452,7 @@ function connectVncDesktop(attempt = 0): void {
   });
 }
 
-function connectFallbackDesktop(): void {
+function connectFallbackDesktop(attempt = 0): void {
   desktopFallbackActive = true;
   activeDesktopIceServers = [];
   const video = document.querySelector<HTMLVideoElement>("#desktop-video");
@@ -1396,19 +1464,24 @@ function connectFallbackDesktop(): void {
 
   const fallbackSocket = new WebSocket(gateWebSocket("ws/desktop-fallback"));
   fallbackSocket.binaryType = "arraybuffer";
-  socket = fallbackSocket;
+  desktopSocket = fallbackSocket;
   fallbackSocket.addEventListener("open", () => {
-    if (socket !== fallbackSocket) return;
+    if (desktopSocket !== fallbackSocket) return;
     setDesktopState("WAITING FOR HTTPS/WSS VIDEO");
+    desktopHeartbeatTimer = window.setInterval(() => {
+      if (desktopSocket === fallbackSocket && fallbackSocket.readyState === WebSocket.OPEN) {
+        fallbackSocket.send(JSON.stringify({ type: "heartbeat" }));
+      }
+    }, 5000);
     desktopNegotiationTimer = window.setTimeout(() => {
-      if (!desktopVideoReady && socket === fallbackSocket) {
+      if (!desktopVideoReady && desktopSocket === fallbackSocket) {
         setDesktopState("NO VIDEO");
         showDesktopMessage("No HTTPS/WSS desktop frame arrived within 8 seconds.");
       }
     }, 8000);
   });
   fallbackSocket.addEventListener("message", (event) => {
-    if (socket !== fallbackSocket) return;
+    if (desktopSocket !== fallbackSocket) return;
     if (event.data instanceof ArrayBuffer) {
       showFallbackFrame(event.data);
       return;
@@ -1425,10 +1498,33 @@ function connectFallbackDesktop(): void {
     }
   });
   fallbackSocket.addEventListener("close", () => {
-    if (socket === fallbackSocket) setDesktopState("DISCONNECTED");
+    if (desktopSocket !== fallbackSocket) return;
+    desktopSocket = null;
+    if (desktopHeartbeatTimer !== null) window.clearInterval(desktopHeartbeatTimer);
+    desktopHeartbeatTimer = null;
+    if (!desktopFallbackActive) return;
+    if (attempt >= 3) {
+      setDesktopState("WSS FAILED");
+      showDesktopMessage("The authenticated HTTPS/WSS desktop connection did not recover.");
+      return;
+    }
+    const delay = 350 * (2 ** attempt);
+    setDesktopState("RETRYING HTTPS/WSS");
+    desktopFallbackRetryTimer = window.setTimeout(() => {
+      desktopFallbackRetryTimer = null;
+      void (async () => {
+        try {
+          await waitForDesktopViewerRelease(4500);
+          if (desktopFallbackActive && desktopSocket === null) connectFallbackDesktop(attempt + 1);
+        } catch (error) {
+          setDesktopState("VIEWER BUSY");
+          showDesktopMessage(error instanceof Error ? error.message : "Another desktop viewer is still active.");
+        }
+      })();
+    }, delay);
   });
   fallbackSocket.addEventListener("error", () => {
-    if (socket === fallbackSocket) {
+    if (desktopSocket === fallbackSocket) {
       setDesktopState("WSS FAILED");
       showDesktopMessage("The authenticated HTTPS/WSS desktop connection failed.");
     }
@@ -1631,6 +1727,7 @@ function installDesktopInput(): void {
   mobileInput?.addEventListener("compositionend", flushDesktopMobileInput);
   mobileInput?.addEventListener("beforeinput", desktopMobileBeforeInput);
   frame.addEventListener("pointermove", (event) => {
+    updateLocalBrowserCursor(frame, event);
     if (desktopVncActive) return;
     if (event.pointerType === "touch") {
       desktopTouchMove(frame, event);
@@ -1663,7 +1760,7 @@ function installDesktopInput(): void {
     }
     desktopControlActive = true;
     frame.focus();
-    if (document.pointerLockElement !== frame) {
+    if (activeBrowserSessionId === null && document.pointerLockElement !== frame) {
       const lockRequest = frame.requestPointerLock();
       if (lockRequest) {
         void lockRequest.catch(() => {
@@ -1684,6 +1781,7 @@ function installDesktopInput(): void {
   frame.addEventListener("pointercancel", (event) => {
     if (event.pointerType === "touch") desktopTouchEnd(frame, event, true);
   });
+  frame.addEventListener("pointerleave", hideLocalBrowserCursor);
   frame.addEventListener("contextmenu", (event) => event.preventDefault());
   frame.addEventListener("wheel", (event) => {
     if (desktopVncActive) return;
@@ -1694,6 +1792,20 @@ function installDesktopInput(): void {
   window.addEventListener("keyup", desktopKeyEvent, { capture: true });
   window.addEventListener("blur", releaseDesktopSuperKey);
   document.addEventListener("pointerlockchange", desktopPointerLockChange);
+}
+
+function updateLocalBrowserCursor(frame: HTMLDivElement, event: PointerEvent): void {
+  if (activeBrowserSessionId === null || event.pointerType === "touch") return;
+  const cursor = document.querySelector<HTMLDivElement>("#desktop-local-cursor");
+  if (!cursor) return;
+  const rect = frame.getBoundingClientRect();
+  cursor.hidden = false;
+  cursor.style.transform = `translate(${event.clientX - rect.left}px, ${event.clientY - rect.top}px)`;
+}
+
+function hideLocalBrowserCursor(): void {
+  const cursor = document.querySelector<HTMLDivElement>("#desktop-local-cursor");
+  if (cursor) cursor.hidden = true;
 }
 
 function desktopTouchStart(frame: HTMLDivElement, event: PointerEvent): void {
@@ -2120,7 +2232,7 @@ function remotePositionFromClient(clientX: number, clientY: number): { x: number
 function sendDesktopInput(message: Record<string, unknown>): void {
   if (!desktopVideoReady) return;
   const payload = JSON.stringify(message);
-  if (desktopFallbackActive && socket?.readyState === WebSocket.OPEN) socket.send(payload);
+  if (desktopFallbackActive && desktopSocket?.readyState === WebSocket.OPEN) desktopSocket.send(payload);
   else if (inputChannel?.readyState === "open") inputChannel.send(payload);
 }
 
@@ -2206,35 +2318,39 @@ function connectSocket(): void {
   if (!terminal || !fitAddon) return;
   const url = gateWebSocket("ws/terminal");
   url.searchParams.set("session", activeTerminalSession);
-  socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
+  const sessionSocket = new WebSocket(url);
+  terminalSocket = sessionSocket;
+  sessionSocket.binaryType = "arraybuffer";
   setSocketState("CONNECTING");
 
-  socket.addEventListener("open", () => {
+  sessionSocket.addEventListener("open", () => {
+    if (terminalSocket !== sessionSocket) return;
     setSocketState("LIVE");
     fitAddon?.fit();
     if (terminal) sendResize({ cols: terminal.cols, rows: terminal.rows });
     terminal?.focus();
   });
-  socket.addEventListener("message", (event) => {
+  sessionSocket.addEventListener("message", (event) => {
+    if (terminalSocket !== sessionSocket) return;
     if (typeof event.data === "string") terminal?.write(event.data);
     else terminal?.write(decoder.decode(event.data));
   });
-  socket.addEventListener("close", (event) => {
+  sessionSocket.addEventListener("close", (event) => {
+    if (terminalSocket !== sessionSocket) return;
     setSocketState(event.code === 4401 ? "LOCKED" : "RECONNECTING");
     if (event.code === 4401) {
       renderLogin("Your gate session expired.");
       return;
     }
     window.setTimeout(() => {
-      if (terminal && socket?.readyState === WebSocket.CLOSED) connectSocket();
+      if (terminal && terminalSocket === sessionSocket && sessionSocket.readyState === WebSocket.CLOSED) connectSocket();
     }, 1200);
   });
 }
 
 function sendResize(size: { cols: number; rows: number }): void {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
+  if (terminalSocket?.readyState === WebSocket.OPEN) {
+    terminalSocket.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
   }
 }
 
@@ -2258,8 +2374,8 @@ function disposeTerminal(): void {
   if (terminalSessionRefreshTimer !== null) window.clearInterval(terminalSessionRefreshTimer);
   terminalSessionRefreshTimer = null;
   window.removeEventListener("resize", fitTerminal);
-  socket?.close();
-  socket = null;
+  terminalSocket?.close();
+  terminalSocket = null;
   terminal?.dispose();
   terminal = null;
   fitAddon = null;
@@ -2279,17 +2395,6 @@ function disposeDesktop(): void {
   window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
   window.removeEventListener("blur", releaseDesktopSuperKey);
   document.removeEventListener("pointerlockchange", desktopPointerLockChange);
-  inputChannel?.close();
-  inputChannel = null;
-  peer?.close();
-  peer = null;
-  if (!terminal) {
-    socket?.close();
-    socket = null;
-  }
-  remoteCandidates = [];
-  desktopVideoReady = false;
-  desktopControlActive = false;
   if (desktopTouchReleaseTimers.size > 0) {
     for (const timer of desktopTouchReleaseTimers) window.clearTimeout(timer);
     desktopTouchReleaseTimers.clear();
@@ -2297,14 +2402,23 @@ function disposeDesktop(): void {
       sendDesktopInput({ type: "pointer_button", button: 0, state: "released" });
     }
   }
+  desktopFallbackActive = false;
+  desktopVncActive = false;
+  inputChannel?.close();
+  inputChannel = null;
+  peer?.close();
+  peer = null;
+  desktopSocket?.close(1000, "view changed");
+  desktopSocket = null;
+  remoteCandidates = [];
+  desktopVideoReady = false;
+  desktopControlActive = false;
   resetDesktopView();
   const mobileInput = document.querySelector<HTMLTextAreaElement>("#desktop-mobile-input");
   if (mobileInput) {
     mobileInput.value = "";
     mobileInput.blur();
   }
-  desktopFallbackActive = false;
-  desktopVncActive = false;
   vnc?.disconnect();
   vnc = null;
   if (desktopFallbackFrameUrl) URL.revokeObjectURL(desktopFallbackFrameUrl);
@@ -2329,6 +2443,10 @@ function disposeDesktop(): void {
   desktopNegotiationTimer = null;
   if (desktopVncRetryTimer !== null) window.clearTimeout(desktopVncRetryTimer);
   desktopVncRetryTimer = null;
+  if (desktopFallbackRetryTimer !== null) window.clearTimeout(desktopFallbackRetryTimer);
+  desktopFallbackRetryTimer = null;
+  if (desktopHeartbeatTimer !== null) window.clearInterval(desktopHeartbeatTimer);
+  desktopHeartbeatTimer = null;
 }
 
 function escapeHtml(value: string): string {

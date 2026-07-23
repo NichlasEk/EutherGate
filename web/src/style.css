@@ -681,6 +681,33 @@ body {
 
 .browser-frame {
   min-height: 420px;
+  cursor: none;
+}
+
+.desktop-local-cursor {
+  position: absolute;
+  z-index: 8;
+  top: -9px;
+  left: -9px;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #f5ff9a;
+  border-radius: 50%;
+  background: rgba(8, 15, 11, .38);
+  box-shadow: 0 0 0 2px rgba(5, 8, 7, .85), 0 0 12px rgba(199, 255, 74, .72);
+  pointer-events: none;
+  will-change: transform;
+}
+
+.desktop-local-cursor::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #fff;
 }
 
 .browser-footer {

@@ -32,11 +32,12 @@ stopping the terminal sessions.
 - The fixed start URL avoids accepting arbitrary launch commands or shell
   fragments from the browser.
 - The existing single-viewer desktop guard also protects the browser stream.
+- A later stability slice added clean viewer handoff, stale-viewer timeout,
+  browser-window closing and a local high-contrast cursor.
 
 ## Deferred
 
 - EutherID step-up before opening the first browser.
-- Closing windows from a chip.
 - Address bar controls and a configurable allowlist.
 - Clipboard/file upload affordances specific to the browser view.
 - WebRTC browser transport; the first slice deliberately uses the already

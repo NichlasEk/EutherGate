@@ -40,7 +40,7 @@ use tokio::{
     net::UnixStream,
     process::Command,
     sync::{Mutex, broadcast},
-    time::{Duration, timeout},
+    time::{Duration, Instant, MissedTickBehavior, timeout},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -62,6 +62,9 @@ const FALLBACK_PACKET_HEADER_BYTES: usize = 5;
 const FALLBACK_MAX_PACKET_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_TERMINAL_SESSION: &str = "gate";
 const BROWSER_WORKSPACE_START: u32 = 10;
+const DESKTOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const DESKTOP_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
+const DESKTOP_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 struct AppState {
@@ -111,6 +114,20 @@ struct BrowserManager {
     profile_dir: PathBuf,
     forge_session_file: PathBuf,
     start_url: String,
+}
+
+struct DesktopViewerGuard {
+    desktop: Arc<DesktopManager>,
+    transport: &'static str,
+}
+
+impl Drop for DesktopViewerGuard {
+    fn drop(&mut self) {
+        self.desktop
+            .viewer_connected
+            .store(false, Ordering::Release);
+        info!(transport = self.transport, "desktop viewer disconnected");
+    }
 }
 
 #[derive(Clone)]
@@ -463,6 +480,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/browser/sessions/{id}/focus",
             post(browser_session_focus),
+        )
+        .route(
+            "/api/browser/sessions/{id}",
+            axum::routing::delete(browser_session_close),
         )
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
@@ -1115,6 +1136,24 @@ async fn browser_session_focus(
     }
 }
 
+async fn browser_session_close(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<u64>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.browser.close(id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -1559,6 +1598,28 @@ async fn desktop_stop(State(state): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+fn acquire_desktop_viewer(
+    desktop: &Arc<DesktopManager>,
+    transport: &'static str,
+) -> Option<DesktopViewerGuard> {
+    if desktop
+        .viewer_connected
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        warn!(
+            transport,
+            "desktop viewer rejected because another viewer is active"
+        );
+        return None;
+    }
+    info!(transport, "desktop viewer connected");
+    Some(DesktopViewerGuard {
+        desktop: desktop.clone(),
+        transport,
+    })
+}
+
 async fn desktop_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -1570,24 +1631,19 @@ async fn desktop_ws(
     if !state.desktop.active.load(Ordering::Acquire) {
         return (StatusCode::CONFLICT, "desktop capture is not active").into_response();
     }
-    if state
-        .desktop
-        .viewer_connected
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let Some(viewer) = acquire_desktop_viewer(&state.desktop, "webrtc") else {
         return (
             StatusCode::CONFLICT,
             "a desktop viewer is already connected",
         )
             .into_response();
-    }
+    };
     let desktop = state.desktop.clone();
     ws.on_upgrade(move |socket| async move {
+        let _viewer = viewer;
         if let Err(error) = desktop_socket(socket, desktop.clone()).await {
             error!(%error, "desktop WebRTC bridge stopped");
         }
-        desktop.viewer_connected.store(false, Ordering::Release);
     })
     .into_response()
 }
@@ -1610,25 +1666,20 @@ async fn desktop_fallback_ws(
         )
             .into_response();
     }
-    if state
-        .desktop
-        .viewer_connected
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let Some(viewer) = acquire_desktop_viewer(&state.desktop, "https-wss") else {
         return (
             StatusCode::CONFLICT,
             "a desktop viewer is already connected",
         )
             .into_response();
-    }
+    };
     let desktop = state.desktop.clone();
     ws.max_message_size(256 * 1024)
         .on_upgrade(move |socket| async move {
+            let _viewer = viewer;
             if let Err(error) = desktop_fallback_socket(socket, desktop.clone()).await {
                 error!(%error, "desktop HTTPS/WSS bridge stopped");
             }
-            desktop.viewer_connected.store(false, Ordering::Release);
         })
         .into_response()
 }
@@ -1655,26 +1706,21 @@ async fn desktop_vnc_ws(
         )
             .into_response();
     };
-    if state
-        .desktop
-        .viewer_connected
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    let Some(viewer) = acquire_desktop_viewer(&state.desktop, "vnc-wss") else {
         return (
             StatusCode::CONFLICT,
             "a desktop viewer is already connected",
         )
             .into_response();
-    }
+    };
     let desktop = state.desktop.clone();
     ws.max_message_size(16 * 1024 * 1024)
         .max_frame_size(16 * 1024 * 1024)
         .on_upgrade(move |socket| async move {
+            let _viewer = viewer;
             if let Err(error) = desktop_vnc_socket(socket, desktop.clone(), profile).await {
                 error!(%error, "desktop VNC/WSS bridge stopped");
             }
-            desktop.viewer_connected.store(false, Ordering::Release);
         })
         .into_response()
 }
@@ -2200,8 +2246,8 @@ impl BrowserManager {
             .as_ref()
             .context("Firefox is unavailable on the EutherGate host")?;
         let existing = self.sessions().await?;
-        if existing.len() >= 8 {
-            anyhow::bail!("EutherBrowse is limited to eight open Firefox windows");
+        if existing.len() >= 4 {
+            anyhow::bail!("EutherBrowse is limited to four open Firefox windows");
         }
         let existing_ids: HashSet<u64> = existing.iter().map(|session| session.id).collect();
         let workspace = existing
@@ -2267,6 +2313,33 @@ impl BrowserManager {
             focused: true,
             ..session
         })
+    }
+
+    async fn close(&self, id: u64) -> Result<()> {
+        let _transition = self.transition.lock().await;
+        let forge = read_forge_session(&self.forge_session_file)?;
+        if !self
+            .sessions()
+            .await?
+            .iter()
+            .any(|session| session.id == id)
+        {
+            anyhow::bail!("EutherBrowse session {id} does not exist");
+        }
+        let criteria = format!("[con_id=\"{id}\"]");
+        swayctl(&forge.sway_socket, &[&criteria, "kill"]).await?;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !self
+                .sessions()
+                .await?
+                .iter()
+                .any(|session| session.id == id)
+            {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("Firefox window {id} did not close in time")
     }
 
     async fn navigate_to_start(&self) -> Result<()> {
@@ -2671,16 +2744,31 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
         .context("HTTPS/WSS helper stdout unavailable")?;
     let mut child_output = BufReader::new(child_output);
     let (mut sender, mut receiver) = socket.split();
+    let mut heartbeat = tokio::time::interval(DESKTOP_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_client_message = Instant::now();
 
     loop {
         tokio::select! {
+            biased;
+            _ = heartbeat.tick() => {
+                if last_client_message.elapsed() >= DESKTOP_HEARTBEAT_TIMEOUT {
+                    anyhow::bail!("HTTPS/WSS desktop viewer heartbeat timed out");
+                }
+            },
             packet = read_fallback_packet(&mut child_output) => match packet {
                 Ok(Some((1, payload))) => {
-                    if sender.send(Message::Binary(payload.into())).await.is_err() { break; }
+                    match timeout(DESKTOP_SEND_TIMEOUT, sender.send(Message::Binary(payload.into()))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
                 }
                 Ok(Some((2, payload))) => {
                     let text = String::from_utf8(payload).context("fallback helper returned invalid JSON text")?;
-                    if sender.send(Message::Text(text.into())).await.is_err() { break; }
+                    match timeout(DESKTOP_SEND_TIMEOUT, sender.send(Message::Text(text.into()))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => break,
+                    }
                 }
                 Ok(Some((kind, _))) => anyhow::bail!("fallback helper returned unknown packet type {kind}"),
                 Ok(None) => break,
@@ -2688,6 +2776,10 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
             },
             message = receiver.next() => match message {
                 Some(Ok(Message::Text(text))) => {
+                    last_client_message = Instant::now();
+                    if text.as_str() == "{\"type\":\"heartbeat\"}" {
+                        continue;
+                    }
                     child_input.write_all(text.as_bytes()).await?;
                     child_input.write_all(b"\n").await?;
                     child_input.flush().await?;
