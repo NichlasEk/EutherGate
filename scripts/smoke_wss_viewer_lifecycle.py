@@ -48,13 +48,29 @@ def viewer(cookie: str):
     )
 
 
-def wait_for_frame(socket) -> None:
+def wait_for_frame(socket, acknowledge: bool = True) -> None:
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
         payload = socket.recv(timeout=max(0.1, deadline - time.monotonic()))
         if isinstance(payload, bytes) and payload.startswith(b"\xff\xd8"):
+            if acknowledge:
+                socket.send(json.dumps({"type": "frame_ack"}))
             return
     raise RuntimeError("viewer did not receive a JPEG frame")
+
+
+def require_frame_gate(socket) -> None:
+    wait_for_frame(socket, acknowledge=False)
+    deadline = time.monotonic() + 0.6
+    while time.monotonic() < deadline:
+        try:
+            payload = socket.recv(timeout=max(0.05, deadline - time.monotonic()))
+        except TimeoutError:
+            break
+        if isinstance(payload, bytes) and payload.startswith(b"\xff\xd8"):
+            raise RuntimeError("a second JPEG arrived before the first frame was acknowledged")
+    socket.send(json.dumps({"type": "frame_ack"}))
+    wait_for_frame(socket)
 
 
 def wait_for_release(cookie: str, timeout: float = 5) -> None:
@@ -92,12 +108,19 @@ def main() -> int:
     replacement.close()
     wait_for_release(cookie)
 
+    gated = viewer(cookie)
+    require_frame_gate(gated)
+    gated.close()
+    wait_for_release(cookie)
+
     healthy = viewer(cookie)
     wait_for_frame(healthy)
     healthy_until = time.monotonic() + 24
     next_heartbeat = time.monotonic() + 4
     while time.monotonic() < healthy_until:
-        healthy.recv(timeout=1)
+        payload = healthy.recv(timeout=1)
+        if isinstance(payload, bytes) and payload.startswith(b"\xff\xd8"):
+            healthy.send(json.dumps({"type": "frame_ack"}))
         if time.monotonic() >= next_heartbeat:
             healthy.send(json.dumps({"type": "heartbeat"}))
             next_heartbeat += 4
@@ -114,7 +137,7 @@ def main() -> int:
     wait_for_release(cookie, timeout=4)
     stale.close()
 
-    print("ok: viewer exclusion, clean replacement and stale-viewer timeout passed")
+    print("ok: viewer exclusion, frame gate, clean replacement and stale-viewer timeout passed")
     return 0
 
 

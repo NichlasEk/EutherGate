@@ -63,6 +63,7 @@ def main() -> int:
                 raise RuntimeError(message.get("message", "fallback helper failed"))
         elif payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
             frame = payload
+            socket.send(json.dumps({"type": "frame_ack"}))
             break
     socket.send(json.dumps({"type": "pointer_move", "x": POINTER_X, "y": POINTER_Y}))
     if CLICK:

@@ -30,12 +30,21 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
 class WssDesktopBridge:
-    def __init__(self, backend: str, output: str, mode: Mode, fps: int, quality: int) -> None:
+    def __init__(
+        self,
+        backend: str,
+        output: str,
+        mode: Mode,
+        fps: int,
+        quality: int,
+        hide_cursor: bool,
+    ) -> None:
         self.backend = backend
         self.output = output
         self.mode = mode
         self.fps = min(mode.fps, fps)
         self.quality = quality
+        self.hide_cursor = hide_cursor
         self.running = threading.Event()
         self.running.set()
         self.input_events: queue.Queue[dict] = queue.Queue(maxsize=256)
@@ -84,18 +93,20 @@ class WssDesktopBridge:
         next_frame = time.monotonic()
         while self.running.is_set():
             try:
+                command = [
+                    "grim",
+                    "-o",
+                    self.output,
+                    "-t",
+                    "jpeg",
+                    "-q",
+                    str(self.quality),
+                    "-",
+                ]
+                if not self.hide_cursor:
+                    command.insert(1, "-c")
                 capture = subprocess.run(
-                    [
-                        "grim",
-                        "-c",
-                        "-o",
-                        self.output,
-                        "-t",
-                        "jpeg",
-                        "-q",
-                        str(self.quality),
-                        "-",
-                    ],
+                    command,
                     check=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -164,6 +175,7 @@ def main() -> int:
     parser.add_argument("--mode", default="1280x720@30")
     parser.add_argument("--fps", type=int, default=12)
     parser.add_argument("--quality", type=int, default=70)
+    parser.add_argument("--hide-cursor", action="store_true")
     parser.add_argument("--probe", action="store_true")
     args = parser.parse_args()
     mode = parse_mode(args.mode)
@@ -176,7 +188,14 @@ def main() -> int:
     if args.probe:
         print("ok: HTTPS/WSS JPEG desktop helper is available")
         return 0
-    WssDesktopBridge(args.backend, args.output, mode, args.fps, args.quality).run()
+    WssDesktopBridge(
+        args.backend,
+        args.output,
+        mode,
+        args.fps,
+        args.quality,
+        args.hide_cursor,
+    ).run()
     return 0
 
 

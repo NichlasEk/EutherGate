@@ -1500,7 +1500,9 @@ function connectFallbackDesktop(attempt = 0): void {
   updateIceDiagnostics();
   setDesktopState("CONNECTING HTTPS/WSS");
 
-  const fallbackSocket = new WebSocket(gateWebSocket("ws/desktop-fallback"));
+  const fallbackUrl = gateWebSocket("ws/desktop-fallback");
+  if (activeBrowserSessionId !== null) fallbackUrl.searchParams.set("cursor", "hidden");
+  const fallbackSocket = new WebSocket(fallbackUrl);
   fallbackSocket.binaryType = "arraybuffer";
   desktopSocket = fallbackSocket;
   fallbackSocket.addEventListener("open", () => {
@@ -1521,7 +1523,7 @@ function connectFallbackDesktop(attempt = 0): void {
   fallbackSocket.addEventListener("message", (event) => {
     if (desktopSocket !== fallbackSocket) return;
     if (event.data instanceof ArrayBuffer) {
-      showFallbackFrame(event.data);
+      showFallbackFrame(event.data, fallbackSocket);
       return;
     }
     const message = JSON.parse(String(event.data)) as Record<string, unknown>;
@@ -1569,14 +1571,30 @@ function connectFallbackDesktop(attempt = 0): void {
   });
 }
 
-function showFallbackFrame(frame: ArrayBuffer): void {
+function showFallbackFrame(frame: ArrayBuffer, socket: WebSocket): void {
   const image = document.querySelector<HTMLImageElement>("#desktop-fallback-image");
-  if (!image) return;
+  const acknowledge = (): void => {
+    if (desktopSocket === socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "frame_ack" }));
+    }
+  };
+  if (!image) {
+    acknowledge();
+    return;
+  }
   if (desktopFallbackFrameUrl) URL.revokeObjectURL(desktopFallbackFrameUrl);
   desktopFallbackFrameUrl = URL.createObjectURL(new Blob([frame], { type: "image/jpeg" }));
-  image.addEventListener("load", () => {
+  const loaded = (): void => {
+    image.removeEventListener("error", failed);
     if (!desktopVideoReady) markDesktopVideoReady();
-  }, { once: true });
+    acknowledge();
+  };
+  const failed = (): void => {
+    image.removeEventListener("load", loaded);
+    acknowledge();
+  };
+  image.addEventListener("load", loaded, { once: true });
+  image.addEventListener("error", failed, { once: true });
   image.src = desktopFallbackFrameUrl;
 }
 

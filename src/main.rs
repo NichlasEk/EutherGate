@@ -255,6 +255,17 @@ struct VncProfileQuery {
     profile: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DesktopFallbackQuery {
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DesktopSocketMessage {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
 impl VncPerformanceProfile {
     fn parse(value: Option<&str>) -> Option<Self> {
         match value.unwrap_or("compatible") {
@@ -1662,6 +1673,7 @@ async fn desktop_fallback_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<DesktopFallbackQuery>,
 ) -> Response {
     if !is_authenticated(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -1684,10 +1696,12 @@ async fn desktop_fallback_ws(
             .into_response();
     };
     let desktop = state.desktop.clone();
+    let hide_cursor = query.cursor.as_deref() == Some("hidden");
     ws.max_message_size(256 * 1024)
         .on_upgrade(move |socket| async move {
             let _viewer = viewer;
-            if let Err(error) = desktop_fallback_socket(socket, desktop.clone()).await {
+            if let Err(error) = desktop_fallback_socket(socket, desktop.clone(), hide_cursor).await
+            {
                 error!(%error, "desktop HTTPS/WSS bridge stopped");
             }
         })
@@ -2705,7 +2719,11 @@ async fn desktop_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Resu
     Ok(())
 }
 
-async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>) -> Result<()> {
+async fn desktop_fallback_socket(
+    socket: WebSocket,
+    desktop: Arc<DesktopManager>,
+    hide_cursor: bool,
+) -> Result<()> {
     let selection = desktop.selection();
     let (backend_name, wayland_display, backend_environment) = match &selection.backend {
         DesktopBackend::Hyprland {
@@ -2738,6 +2756,9 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    if hide_cursor {
+        command.arg("--hide-cursor");
+    }
     if let Some((name, value)) = backend_environment {
         command.env(name, value);
     }
@@ -2757,6 +2778,8 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
     let mut heartbeat = tokio::time::interval(DESKTOP_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_client_message = Instant::now();
+    let mut frame_in_flight = false;
+    let mut pending_frame = None;
 
     loop {
         tokio::select! {
@@ -2768,9 +2791,13 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
             },
             packet = read_fallback_packet(&mut child_output) => match packet {
                 Ok(Some((1, payload))) => {
-                    match timeout(DESKTOP_SEND_TIMEOUT, sender.send(Message::Binary(payload.into()))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) | Err(_) => break,
+                    if frame_in_flight {
+                        pending_frame = Some(payload);
+                    } else {
+                        match timeout(DESKTOP_SEND_TIMEOUT, sender.send(Message::Binary(payload.into()))).await {
+                            Ok(Ok(())) => frame_in_flight = true,
+                            Ok(Err(_)) | Err(_) => break,
+                        }
                     }
                 }
                 Ok(Some((2, payload))) => {
@@ -2787,7 +2814,20 @@ async fn desktop_fallback_socket(socket: WebSocket, desktop: Arc<DesktopManager>
             message = receiver.next() => match message {
                 Some(Ok(Message::Text(text))) => {
                     last_client_message = Instant::now();
-                    if text.as_str() == "{\"type\":\"heartbeat\"}" {
+                    let message_kind = serde_json::from_str::<DesktopSocketMessage>(&text)
+                        .ok()
+                        .map(|message| message.kind);
+                    if message_kind.as_deref() == Some("heartbeat") {
+                        continue;
+                    }
+                    if message_kind.as_deref() == Some("frame_ack") {
+                        frame_in_flight = false;
+                        if let Some(payload) = pending_frame.take() {
+                            match timeout(DESKTOP_SEND_TIMEOUT, sender.send(Message::Binary(payload.into()))).await {
+                                Ok(Ok(())) => frame_in_flight = true,
+                                Ok(Err(_)) | Err(_) => break,
+                            }
+                        }
                         continue;
                     }
                     child_input.write_all(text.as_bytes()).await?;
