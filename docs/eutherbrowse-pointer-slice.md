@@ -23,6 +23,10 @@ button state and the target coordinate reached Firefox as one pointer stream.
   buttons, and releases them on cancellation, blur or view disposal.
 - Each Firefox session chip has its own small close button. It closes exactly
   that Firefox window without first activating it.
+- Closing the active Firefox window is transactional: Gate first confirms the
+  exact window was closed, then releases the viewer and opens the next session.
+  A failed close leaves the existing viewer connected and usable instead of
+  replacing it with a dead error screen.
 - The WSS smoke test can opt into a real click and explicit coordinates with
   `EUTHERGATE_SMOKE_CLICK=1`, `EUTHERGATE_SMOKE_X` and
   `EUTHERGATE_SMOKE_Y`.
@@ -41,6 +45,11 @@ A temporary Firefox event page recorded `CLICK_800_500` from the Rust helper and
 `CLICK_640_400` through the real Python `InputController`. The temporary window,
 HTTP server, cookie and screenshots were removed afterwards, and focus was
 returned to the persistent ChatGPT window on Forge workspace 11.
+
+A post-deploy regression test then recorded `CLICK_639_313` through the complete
+live HTTPS/WSS pipeline. A separate live test closed only temporary Firefox
+window 28 with HTTP 204 while the WSS viewer was still connected. The two user
+Firefox windows on workspaces 10 and 11 remained open.
 
 The normal Rust tests, Python syntax checks and TypeScript/Vite production build
 must pass before the Gate restart.

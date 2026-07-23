@@ -638,25 +638,34 @@ async function createBrowserSession(): Promise<void> {
 async function closeActiveBrowserSession(): Promise<void> {
   const id = activeBrowserSessionId;
   if (id === null) return;
-  const button = document.querySelector<HTMLButtonElement>("#browser-close");
-  if (button) button.disabled = true;
+  const buttons = document.querySelectorAll<HTMLButtonElement>(
+    `#browser-close, [data-close-browser-session="${id}"]`,
+  );
+  buttons.forEach((button) => { button.disabled = true; });
   setDesktopState("CLOSING");
-  disposeDesktop();
   try {
-    await waitForDesktopViewerRelease();
     const response = await fetch(gateUrl(`api/browser/sessions/${id}`), { method: "DELETE" });
     if (response.status === 401) return renderLogin("Your gate session expired.");
     if (!response.ok) throw new Error(await responseError(response, "Could not close Firefox window."));
-    activeBrowserSessionId = null;
+  } catch (error) {
+    setDesktopState("CLOSE FAILED / STILL LIVE");
+    console.warn("EutherBrowse close failed:", error);
+    buttons.forEach((button) => { button.disabled = false; });
+    return;
+  }
+
+  activeBrowserSessionId = null;
+  disposeDesktop();
+  try {
+    await waitForDesktopViewerRelease();
     const sessionsResponse = await fetch(gateUrl("api/browser/sessions"));
     const body = (await sessionsResponse.json()) as { sessions?: BrowserSessionInfo[] };
     const next = body.sessions?.[0];
     if (sessionsResponse.ok && next) await renderBrowser(next.id);
     else renderTerminal();
   } catch (error) {
-    setDesktopState("CLOSE FAILED");
-    showDesktopMessage(error instanceof Error ? error.message : "Could not close Firefox window.");
-    if (button) button.disabled = false;
+    console.warn("EutherBrowse could not open the next view after closing:", error);
+    renderTerminal();
   }
 }
 

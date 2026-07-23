@@ -1145,12 +1145,18 @@ async fn browser_session_close(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.browser.close(id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response(),
+        Ok(()) => {
+            info!(browser_session_id = id, "Firefox window closed");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => {
+            warn!(browser_session_id = id, %error, "Firefox window close failed");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
