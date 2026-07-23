@@ -68,6 +68,13 @@ fullscreen disable/enable cycle. WSS input therefore schedules one such repaint
 coalesced to at most roughly 12 per second. Because text injection now waits for
 `wtype` to finish, the repaint cannot race ahead of delivery to Firefox.
 
+The same stale framebuffer can otherwise hide asynchronous page changes after
+the last input, including a streaming ChatGPT answer. Browser activity therefore
+arms a bounded three-minute live-refresh window. While the Gate tab is visible,
+one coalesced Sway repaint is requested every 900 ms; leaving EutherBrowse or
+letting the window expire stops the timer. The fullscreen disable/enable pair is
+sent in one Sway IPC command to avoid spawning two helper processes per pulse.
+
 ## Verification
 
 The lifecycle smoke test now proves that a second JPEG cannot arrive before the

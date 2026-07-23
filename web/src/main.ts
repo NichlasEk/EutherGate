@@ -149,6 +149,8 @@ let desktopNegotiationTimer: number | null = null;
 let desktopVncRetryTimer: number | null = null;
 let desktopFallbackRetryTimer: number | null = null;
 let desktopHeartbeatTimer: number | null = null;
+let browserLiveRefreshTimer: number | null = null;
+let browserLiveRefreshUntil = 0;
 let vncSuperHeld = false;
 let desktopSuperHeld = false;
 let desktopControlActive = false;
@@ -170,6 +172,8 @@ let desktopVncPinchStartScale = 1;
 const desktopTouchReleaseTimers = new Set<number>();
 
 const clipboardLimit = 8 * 1024 * 1024;
+const browserLiveRefreshIntervalMs = 900;
+const browserLiveRefreshWindowMs = 3 * 60 * 1000;
 const transportPreferenceKey = "euthergate.transport-profile";
 const vncProfilePreferenceKey = "euthergate.vnc-performance-profile";
 const remoteSuperKeysym = 0xffeb;
@@ -1865,7 +1869,29 @@ function markDesktopVideoReady(): void {
   desktopNegotiationTimer = null;
   hideDesktopMessage();
   setDesktopState(desktopFallbackActive || inputChannel?.readyState === "open" ? "LIVE" : "VIDEO");
+  if (activeBrowserSessionId !== null && desktopFallbackActive) armBrowserLiveRefresh(15_000);
   if (!desktopFallbackActive) void updateSelectedIceRoute();
+}
+
+function armBrowserLiveRefresh(durationMs = browserLiveRefreshWindowMs): void {
+  if (activeBrowserSessionId === null || !desktopFallbackActive) return;
+  browserLiveRefreshUntil = Math.max(browserLiveRefreshUntil, Date.now() + durationMs);
+  if (browserLiveRefreshTimer !== null) return;
+  browserLiveRefreshTimer = window.setInterval(() => {
+    if (
+      activeBrowserSessionId === null
+      || !desktopFallbackActive
+      || Date.now() >= browserLiveRefreshUntil
+    ) {
+      if (browserLiveRefreshTimer !== null) window.clearInterval(browserLiveRefreshTimer);
+      browserLiveRefreshTimer = null;
+      browserLiveRefreshUntil = 0;
+      return;
+    }
+    if (document.visibilityState === "visible" && desktopVideoReady) {
+      sendDesktopInput({ type: "refresh" });
+    }
+  }, browserLiveRefreshIntervalMs);
 }
 
 function installDesktopInput(): void {
@@ -2450,6 +2476,13 @@ function remotePositionFromClient(clientX: number, clientY: number): { x: number
 
 function sendDesktopInput(message: Record<string, unknown>): void {
   if (!desktopVideoReady) return;
+  const shouldArmBrowserRefresh = activeBrowserSessionId !== null && (
+    message.type === "text"
+    || message.type === "wheel"
+    || (message.type === "key" && message.state === "pressed" && !message.repeat)
+    || (message.type === "pointer_button" && message.state === "pressed")
+  );
+  if (shouldArmBrowserRefresh) armBrowserLiveRefresh();
   const payload = JSON.stringify(message);
   if (desktopFallbackActive && desktopSocket?.readyState === WebSocket.OPEN) desktopSocket.send(payload);
   else if (inputChannel?.readyState === "open") inputChannel.send(payload);
@@ -2668,6 +2701,9 @@ function disposeDesktop(): void {
   desktopFallbackRetryTimer = null;
   if (desktopHeartbeatTimer !== null) window.clearInterval(desktopHeartbeatTimer);
   desktopHeartbeatTimer = null;
+  if (browserLiveRefreshTimer !== null) window.clearInterval(browserLiveRefreshTimer);
+  browserLiveRefreshTimer = null;
+  browserLiveRefreshUntil = 0;
 }
 
 function escapeHtml(value: string): string {
