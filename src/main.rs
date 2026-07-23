@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     io::{Read, Write},
     net::SocketAddr,
@@ -61,6 +61,7 @@ const TURN_CREDENTIAL_TTL_SECONDS: u64 = 60 * 60;
 const FALLBACK_PACKET_HEADER_BYTES: usize = 5;
 const FALLBACK_MAX_PACKET_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_TERMINAL_SESSION: &str = "gate";
+const BROWSER_WORKSPACE_START: u32 = 10;
 
 #[derive(Clone)]
 struct AppState {
@@ -72,6 +73,7 @@ struct AppState {
     terminals: Arc<TerminalManager>,
     terminal_upload_dir: Arc<PathBuf>,
     desktop: Arc<DesktopManager>,
+    browser: Arc<BrowserManager>,
 }
 
 struct TerminalSession {
@@ -101,6 +103,14 @@ struct DesktopManager {
     fallback_helper: PathBuf,
     wayvnc: Option<PathBuf>,
     vnc_keyboard: String,
+}
+
+struct BrowserManager {
+    transition: Mutex<()>,
+    firefox: Option<PathBuf>,
+    profile_dir: PathBuf,
+    forge_session_file: PathBuf,
+    start_url: String,
 }
 
 #[derive(Clone)]
@@ -166,6 +176,14 @@ struct TerminalSessionQuery {
 #[derive(Deserialize)]
 struct CreateTerminalSessionRequest {
     name: String,
+}
+
+#[derive(Clone, Serialize)]
+struct BrowserSessionInfo {
+    id: u64,
+    title: String,
+    workspace: String,
+    focused: bool,
 }
 
 #[derive(Serialize)]
@@ -318,6 +336,23 @@ struct SwayMode {
     refresh: u32,
 }
 
+#[derive(Deserialize)]
+struct SwayTreeNode {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default, rename = "type")]
+    node_type: String,
+    #[serde(default)]
+    nodes: Vec<SwayTreeNode>,
+    #[serde(default)]
+    floating_nodes: Vec<SwayTreeNode>,
+}
+
 struct ForgeSession {
     wayland_display: String,
     sway_socket: String,
@@ -387,6 +422,13 @@ async fn main() -> Result<()> {
             wayvnc: config.wayvnc.clone(),
             vnc_keyboard: config.vnc_keyboard.clone(),
         }),
+        browser: Arc::new(BrowserManager {
+            transition: Mutex::new(()),
+            firefox: config.firefox.clone(),
+            profile_dir: config.browser_profile_dir.clone(),
+            forge_session_file: config.forge_session_file.clone(),
+            start_url: config.browser_start_url.clone(),
+        }),
     };
 
     let static_files = Router::new()
@@ -414,6 +456,14 @@ async fn main() -> Result<()> {
             get(terminal_sessions).post(terminal_session_create),
         )
         .route("/api/terminal/local", post(terminal_local_create))
+        .route(
+            "/api/browser/sessions",
+            get(browser_sessions).post(browser_session_create),
+        )
+        .route(
+            "/api/browser/sessions/{id}/focus",
+            post(browser_session_focus),
+        )
         .route("/api/desktop/status", get(desktop_status))
         .route("/api/desktop/start", post(desktop_start))
         .route("/api/desktop/stop", post(desktop_stop))
@@ -467,6 +517,9 @@ struct Config {
     vnc_keyboard: String,
     forge_session_file: PathBuf,
     terminal_upload_dir: PathBuf,
+    firefox: Option<PathBuf>,
+    browser_profile_dir: PathBuf,
+    browser_start_url: String,
 }
 
 impl Config {
@@ -572,6 +625,27 @@ impl Config {
                     .join("terminal-images")
             });
         prepare_private_directory(&terminal_upload_dir)?;
+        let firefox = env::var_os("EUTHERGATE_FIREFOX_BIN")
+            .map(PathBuf::from)
+            .map(|path| resolve_executable(&path))
+            .unwrap_or_else(|| resolve_executable(Path::new("firefox")));
+        let browser_profile_dir = env::var_os("EUTHERGATE_BROWSER_PROFILE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(format!("/home/{}", nix_uid())))
+                    .join(".local/share/euthergate/browser/firefox-profile")
+            });
+        prepare_private_directory(&browser_profile_dir)?;
+        prepare_firefox_profile(&browser_profile_dir)?;
+        let browser_start_url = env::var("EUTHERGATE_BROWSER_START_URL")
+            .unwrap_or_else(|_| "https://chatgpt.com/".into());
+        if !browser_start_url.starts_with("https://")
+            || browser_start_url.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!("EUTHERGATE_BROWSER_START_URL must be one HTTPS URL");
+        }
 
         Ok(Self {
             bind,
@@ -593,6 +667,9 @@ impl Config {
             vnc_keyboard,
             forge_session_file,
             terminal_upload_dir,
+            firefox,
+            browser_profile_dir,
+            browser_start_url,
         })
     }
 }
@@ -979,6 +1056,62 @@ async fn terminal_local_create(State(state): State<AppState>, headers: HeaderMap
             )
                 .into_response()
         }
+    }
+}
+
+async fn browser_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.browser.sessions().await {
+        Ok(sessions) => Json(serde_json::json!({
+            "available": state.browser.firefox.is_some(),
+            "sessions": sessions,
+        }))
+        .into_response(),
+        Err(error) => {
+            warn!(%error, "could not list EutherBrowse sessions");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn browser_session_create(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.browser.launch().await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => {
+            error!(%error, "could not launch EutherBrowse Firefox window");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn browser_session_focus(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<u64>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.browser.focus(id).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -2053,6 +2186,171 @@ async fn start_idle_hold() -> u64 {
     }
 }
 
+impl BrowserManager {
+    async fn sessions(&self) -> Result<Vec<BrowserSessionInfo>> {
+        let forge = read_forge_session(&self.forge_session_file)?;
+        let raw = swayctl(&forge.sway_socket, &["-t", "get_tree", "-r"]).await?;
+        parse_browser_sessions(&raw)
+    }
+
+    async fn launch(&self) -> Result<BrowserSessionInfo> {
+        let _transition = self.transition.lock().await;
+        let firefox = self
+            .firefox
+            .as_ref()
+            .context("Firefox is unavailable on the EutherGate host")?;
+        let existing = self.sessions().await?;
+        if existing.len() >= 8 {
+            anyhow::bail!("EutherBrowse is limited to eight open Firefox windows");
+        }
+        let existing_ids: HashSet<u64> = existing.iter().map(|session| session.id).collect();
+        let workspace = existing
+            .iter()
+            .filter_map(|session| session.workspace.parse::<u32>().ok())
+            .max()
+            .map(|value| value.saturating_add(1))
+            .unwrap_or(BROWSER_WORKSPACE_START)
+            .max(BROWSER_WORKSPACE_START);
+        let forge = read_forge_session(&self.forge_session_file)?;
+        let workspace = workspace.to_string();
+        swayctl(&forge.sway_socket, &["workspace", "number", &workspace]).await?;
+        let mut arguments = Vec::new();
+        if existing.is_empty() {
+            arguments.push("--new-instance");
+        }
+        arguments.extend([
+            "--profile",
+            self.profile_dir
+                .to_str()
+                .context("Firefox profile path is not UTF-8")?,
+            "--new-window",
+            &self.start_url,
+        ]);
+        let command = format!(
+            "env MOZ_ENABLE_WAYLAND=1 {} {}",
+            shell_quote(&firefox.display().to_string()),
+            arguments
+                .iter()
+                .map(|argument| shell_quote(argument))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        swayctl(&forge.sway_socket, &["exec", &command]).await?;
+
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let sessions = self.sessions().await?;
+            if let Some(session) = sessions
+                .into_iter()
+                .find(|session| !existing_ids.contains(&session.id))
+            {
+                let session = self.focus(session.id).await?;
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                self.navigate_to_start().await?;
+                return Ok(session);
+            }
+        }
+        anyhow::bail!("Firefox did not publish a new EutherBrowse window in time")
+    }
+
+    async fn focus(&self, id: u64) -> Result<BrowserSessionInfo> {
+        let forge = read_forge_session(&self.forge_session_file)?;
+        let sessions = self.sessions().await?;
+        let session = sessions
+            .into_iter()
+            .find(|session| session.id == id)
+            .with_context(|| format!("EutherBrowse session {id} does not exist"))?;
+        let criteria = format!("[con_id=\"{id}\"]");
+        swayctl(&forge.sway_socket, &[&criteria, "focus"]).await?;
+        swayctl(&forge.sway_socket, &[&criteria, "fullscreen", "enable"]).await?;
+        Ok(BrowserSessionInfo {
+            focused: true,
+            ..session
+        })
+    }
+
+    async fn navigate_to_start(&self) -> Result<()> {
+        let forge = read_forge_session(&self.forge_session_file)?;
+        let typed = Command::new("wtype")
+            .env("WAYLAND_DISPLAY", &forge.wayland_display)
+            .env("SWAYSOCK", &forge.sway_socket)
+            .args(["-M", "ctrl", "-k", "l", "-m", "ctrl", "-s", "100", "--"])
+            .arg(&self.start_url)
+            .output()
+            .await
+            .context("could not type the fixed EutherBrowse start URL")?;
+        if !typed.status.success() {
+            anyhow::bail!(
+                "wtype could not enter the EutherBrowse start URL: {}",
+                String::from_utf8_lossy(&typed.stderr).trim()
+            );
+        }
+        let entered = Command::new("wtype")
+            .env("WAYLAND_DISPLAY", &forge.wayland_display)
+            .env("SWAYSOCK", &forge.sway_socket)
+            .args(["-k", "Return"])
+            .output()
+            .await
+            .context("could not submit the fixed EutherBrowse start URL")?;
+        if !entered.status.success() {
+            anyhow::bail!(
+                "wtype could not submit the EutherBrowse start URL: {}",
+                String::from_utf8_lossy(&entered.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn parse_browser_sessions(raw: &str) -> Result<Vec<BrowserSessionInfo>> {
+    let root: SwayTreeNode =
+        serde_json::from_str(raw).context("swaymsg returned invalid tree JSON")?;
+    let mut sessions = Vec::new();
+    collect_browser_sessions(&root, "", &mut sessions);
+    sessions.sort_by(|left, right| {
+        browser_workspace_number(&left.workspace)
+            .cmp(&browser_workspace_number(&right.workspace))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(sessions)
+}
+
+fn collect_browser_sessions(
+    node: &SwayTreeNode,
+    parent_workspace: &str,
+    sessions: &mut Vec<BrowserSessionInfo>,
+) {
+    let workspace = if node.node_type == "workspace" {
+        node.name.as_deref().unwrap_or(parent_workspace)
+    } else {
+        parent_workspace
+    };
+    if node.app_id.as_deref().is_some_and(is_firefox_app_id) {
+        sessions.push(BrowserSessionInfo {
+            id: node.id,
+            title: node
+                .name
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("Firefox")
+                .to_owned(),
+            workspace: workspace.to_owned(),
+            focused: node.focused,
+        });
+    }
+    for child in node.nodes.iter().chain(&node.floating_nodes) {
+        collect_browser_sessions(child, workspace, sessions);
+    }
+}
+
+fn is_firefox_app_id(app_id: &str) -> bool {
+    matches!(app_id, "firefox" | "org.mozilla.firefox")
+}
+
+fn browser_workspace_number(workspace: &str) -> u32 {
+    workspace.parse().unwrap_or(u32::MAX)
+}
+
 async fn swayctl(socket: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("swaymsg")
         .env("SWAYSOCK", socket)
@@ -2184,6 +2482,30 @@ fn prepare_private_directory(path: &Path) -> Result<()> {
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .with_context(|| format!("could not secure {}", path.display()))?;
+    Ok(())
+}
+
+fn prepare_firefox_profile(path: &Path) -> Result<()> {
+    let preferences = path.join("user.js");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&preferences)
+        .with_context(|| format!("could not prepare {}", preferences.display()))?;
+    std::fs::set_permissions(&preferences, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("could not secure {}", preferences.display()))?;
+    file.write_all(
+        br#"user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.page", 0);
+user_pref("browser.tabs.warnOnClose", false);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("extensions.enabledScopes", 1);
+user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+"#,
+    )
+    .with_context(|| format!("could not initialize {}", preferences.display()))?;
     Ok(())
 }
 
@@ -3223,6 +3545,44 @@ mod tests {
         assert_eq!(sessions[1].other_clients, 1);
         assert_eq!(sessions[1].path, "/home/nichlas/work");
         assert!(parse_terminal_sessions("broken\trow\n").is_err());
+    }
+
+    #[test]
+    fn browser_sessions_include_only_firefox_windows_and_keep_workspaces() {
+        let sessions = parse_browser_sessions(
+            r#"{
+                "id": 1,
+                "type": "root",
+                "nodes": [
+                    {
+                        "id": 2,
+                        "type": "workspace",
+                        "name": "10",
+                        "nodes": [
+                            {"id": 20, "type": "con", "name": "ChatGPT — Mozilla Firefox", "app_id": "firefox", "focused": true},
+                            {"id": 21, "type": "con", "name": "Forge", "app_id": "kitty", "focused": false}
+                        ]
+                    },
+                    {
+                        "id": 3,
+                        "type": "workspace",
+                        "name": "11",
+                        "nodes": [
+                            {"id": 22, "type": "con", "name": "OpenAI", "app_id": "org.mozilla.firefox", "focused": false}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, 20);
+        assert_eq!(sessions[0].workspace, "10");
+        assert!(sessions[0].focused);
+        assert_eq!(sessions[1].id, 22);
+        assert_eq!(sessions[1].workspace, "11");
+        assert!(is_firefox_app_id("firefox"));
+        assert!(!is_firefox_app_id("firefox-evil"));
     }
 
     #[test]

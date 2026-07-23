@@ -20,6 +20,13 @@ type TerminalSessionInfo = {
   path: string;
 };
 
+type BrowserSessionInfo = {
+  id: number;
+  title: string;
+  workspace: string;
+  focused: boolean;
+};
+
 type DesktopStatus = {
   available: boolean;
   active: boolean;
@@ -124,6 +131,7 @@ let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 const terminalSessionPreferenceKey = "euthergate.terminal-session";
 let activeTerminalSession = loadTerminalSessionPreference();
+let activeBrowserSessionId: number | null = null;
 let terminalSessionRefreshTimer: number | null = null;
 let peer: RTCPeerConnection | null = null;
 let inputChannel: RTCDataChannel | null = null;
@@ -197,7 +205,7 @@ function gateWebSocket(path: string): URL {
   return url;
 }
 
-type GateView = "login" | "terminal" | "desktop";
+type GateView = "login" | "terminal" | "browser" | "desktop";
 
 function gateShell(content: string, view: GateView = "login"): string {
   const cockpit = view !== "login";
@@ -224,6 +232,9 @@ function gateShell(content: string, view: GateView = "login"): string {
               <button class="sidebar-link${view === "desktop" ? " is-active" : ""}" data-gate-view="desktop" type="button">
                 <span>DESKTOP</span><small>Remote Wayland</small>
               </button>
+              <button class="sidebar-link${view === "browser" ? " is-active" : ""}" data-gate-view="browser" type="button">
+                <span>BROWSER</span><small>Home Firefox</small>
+              </button>
             </div>
             <div class="sidebar-section">
               <span class="sidebar-label">QUICK ACTIONS</span>
@@ -242,12 +253,12 @@ function gateShell(content: string, view: GateView = "login"): string {
             </section>
             <section class="rail-card">
               <span class="rail-label">ACTIVE VIEW</span>
-              <strong>${view === "terminal" ? "FORGE SHELL" : "WAYLAND DESKTOP"}</strong>
-              <small>${view === "terminal" ? "Persistent PTY channel" : "Live transport control"}</small>
+              <strong>${view === "terminal" ? "FORGE SHELL" : view === "browser" ? "EUTHERBROWSE" : "WAYLAND DESKTOP"}</strong>
+              <small>${view === "terminal" ? "Persistent PTY channel" : view === "browser" ? "Private home Firefox" : "Live transport control"}</small>
             </section>
             <section class="rail-card rail-trace">
               <span class="rail-label">OXIDATIVE TRACE</span>
-              <p>${view === "terminal" ? "Shell output remains attached across reloads." : "Transport diagnostics appear below the stream."}</p>
+              <p>${view === "terminal" ? "Shell output remains attached across reloads." : view === "browser" ? "Firefox cookies remain on the Gate host." : "Transport diagnostics appear below the stream."}</p>
             </section>
           </aside>
         </div>` : content}
@@ -257,6 +268,7 @@ function gateShell(content: string, view: GateView = "login"): string {
 function bindCockpitNavigation(): void {
   document.querySelector<HTMLButtonElement>('[data-gate-view="terminal"]')?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>('[data-gate-view="desktop"]')?.addEventListener("click", renderDesktop);
+  document.querySelector<HTMLButtonElement>('[data-gate-view="browser"]')?.addEventListener("click", openOrShowBrowser);
   document.querySelector<HTMLButtonElement>(".sidebar-wake")?.addEventListener("click", wakeScreens);
 }
 
@@ -283,6 +295,7 @@ function renderLogin(message = ""): void {
 
 function renderTerminal(): void {
   disposeViews();
+  activeBrowserSessionId = null;
   app.innerHTML = gateShell(`
     <section class="workspace">
       <div class="workspace-bar">
@@ -296,6 +309,7 @@ function renderTerminal(): void {
           </select>
           <button id="terminal-session-new" class="ghost-button" type="button">+ SESSION</button>
           <button id="terminal-local-new" class="ghost-button" type="button">OPEN TERMINAL</button>
+          <button id="browser-new" class="ghost-button" type="button">OPEN BROWSER</button>
           <span id="socket-state" class="socket-state">CONNECTING</span>
           <button class="ghost-button wake-screens" type="button">WAKE SCREENS</button>
           <button id="terminal-image-button" class="ghost-button" type="button">PASTE IMAGE</button>
@@ -355,6 +369,7 @@ function renderTerminal(): void {
   document.querySelector<HTMLSelectElement>("#terminal-session-picker")?.addEventListener("change", switchTerminalSession);
   document.querySelector<HTMLButtonElement>("#terminal-session-new")?.addEventListener("click", createTerminalSession);
   document.querySelector<HTMLButtonElement>("#terminal-local-new")?.addEventListener("click", openLocalTerminal);
+  document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", createBrowserSession);
   bindCockpitNavigation();
   void refreshTerminalSessions();
   terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
@@ -381,11 +396,18 @@ function saveTerminalSessionPreference(name: string): void {
 
 async function refreshTerminalSessions(): Promise<void> {
   const picker = document.querySelector<HTMLSelectElement>("#terminal-session-picker");
-  if (!picker) return;
+  const strip = document.querySelector<HTMLDivElement>("#terminal-session-strip");
+  if (!picker && !strip) return;
   try {
-    const response = await fetch(gateUrl("api/terminal/sessions"));
+    const [response, browserResponse] = await Promise.all([
+      fetch(gateUrl("api/terminal/sessions")),
+      fetch(gateUrl("api/browser/sessions")),
+    ]);
     const body = (await response.json()) as { sessions?: TerminalSessionInfo[]; error?: string };
     if (!response.ok) throw new Error(body.error || "Could not list terminal sessions.");
+    const browserBody = browserResponse.ok
+      ? (await browserResponse.json()) as { sessions?: BrowserSessionInfo[] }
+      : { sessions: [] };
     const sessions = (body.sessions || []).sort((left, right) => {
       if (left.name === "gate") return -1;
       if (right.name === "gate") return 1;
@@ -402,23 +424,28 @@ async function refreshTerminalSessions(): Promise<void> {
         path: "",
       });
     }
-    picker.innerHTML = sessions.map((session) => {
-      const detail = `${session.windows}W${session.attached > 0 ? ` · ${session.attached}A` : ""}`;
-      return `<option value="${escapeHtml(session.name)}"${session.name === activeTerminalSession ? " selected" : ""}>${escapeHtml(session.name)} · ${detail}</option>`;
-    }).join("");
-    renderTerminalSessionStrip(sessions);
+    if (picker) {
+      picker.innerHTML = sessions.map((session) => {
+        const detail = `${session.windows}W${session.attached > 0 ? ` · ${session.attached}A` : ""}`;
+        return `<option value="${escapeHtml(session.name)}"${session.name === activeTerminalSession ? " selected" : ""}>${escapeHtml(session.name)} · ${detail}</option>`;
+      }).join("");
+    }
+    renderTerminalSessionStrip(sessions, browserBody.sessions || []);
   } catch (error) {
     setSocketState("SESSION LIST FAILED");
     setTerminalImageStatus(error instanceof Error ? error.message : "Could not list terminal sessions.", true);
   }
 }
 
-function renderTerminalSessionStrip(sessions: TerminalSessionInfo[]): void {
+function renderTerminalSessionStrip(
+  sessions: TerminalSessionInfo[],
+  browserSessions: BrowserSessionInfo[],
+): void {
   const strip = document.querySelector<HTMLDivElement>("#terminal-session-strip");
   if (!strip) return;
   const now = Math.floor(Date.now() / 1000);
-  strip.innerHTML = sessions.map((session) => {
-    const active = session.name === activeTerminalSession;
+  const terminalChips = sessions.map((session) => {
+    const active = activeBrowserSessionId === null && session.name === activeTerminalSession;
     const recent = session.activity > 0 && now - session.activity < 15;
     const context = terminalSessionPath(session.path);
     const clients = session.other_clients > 0
@@ -441,9 +468,39 @@ function renderTerminalSessionStrip(sessions: TerminalSessionInfo[]): void {
         </span>
       </button>`;
   }).join("");
+  const browserChips = browserSessions.map((session) => {
+    const active = session.id === activeBrowserSessionId;
+    const label = browserSessionLabel(session.title);
+    return `
+      <button class="terminal-session-chip browser-session-chip${active ? " is-active" : ""}"
+        type="button" data-browser-session="${session.id}" aria-pressed="${active}" title="${escapeHtml(session.title)}">
+        <span class="terminal-session-chip-top">
+          <i aria-hidden="true"></i>
+          <strong>${escapeHtml(label)}</strong>
+          <small>WS ${escapeHtml(session.workspace)}</small>
+        </span>
+        <span class="terminal-session-chip-detail">
+          <b>FIREFOX</b>
+          <em>HOME PROFILE</em>
+        </span>
+      </button>`;
+  }).join("");
+  strip.innerHTML = terminalChips + browserChips;
   strip.querySelectorAll<HTMLButtonElement>("[data-terminal-session]").forEach((button) => {
     button.addEventListener("click", () => switchToTerminalSession(button.dataset.terminalSession || ""));
   });
+  strip.querySelectorAll<HTMLButtonElement>("[data-browser-session]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = Number(button.dataset.browserSession);
+      if (Number.isSafeInteger(id)) void renderBrowser(id);
+    });
+  });
+}
+
+function browserSessionLabel(title: string): string {
+  const clean = title.replace(/\s*[—-]\s*Mozilla Firefox\s*$/i, "").trim();
+  if (/chatgpt/i.test(clean)) return "CHATGPT";
+  return clean.slice(0, 24) || "FIREFOX";
 }
 
 function terminalSessionLabel(name: string): string {
@@ -472,7 +529,9 @@ function switchTerminalSession(event: Event): void {
 }
 
 function switchToTerminalSession(name: string): void {
-  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name) || name === activeTerminalSession) return;
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return;
+  if (activeBrowserSessionId === null && name === activeTerminalSession) return;
+  activeBrowserSessionId = null;
   saveTerminalSessionPreference(name);
   renderTerminal();
 }
@@ -517,6 +576,118 @@ async function openLocalTerminal(): Promise<void> {
     setTerminalImageStatus(error instanceof Error ? error.message : "Could not open local terminal.", true);
   } finally {
     if (button) button.disabled = false;
+  }
+}
+
+async function openOrShowBrowser(): Promise<void> {
+  if (activeBrowserSessionId !== null) {
+    await renderBrowser(activeBrowserSessionId);
+    return;
+  }
+  try {
+    const response = await fetch(gateUrl("api/browser/sessions"));
+    const body = (await response.json()) as { sessions?: BrowserSessionInfo[]; error?: string };
+    if (!response.ok) throw new Error(body.error || "Could not list browser sessions.");
+    const existing = body.sessions?.[0];
+    if (existing) {
+      await renderBrowser(existing.id);
+      return;
+    }
+  } catch (error) {
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not open EutherBrowse.", true);
+    return;
+  }
+  await createBrowserSession();
+}
+
+async function createBrowserSession(): Promise<void> {
+  const buttons = document.querySelectorAll<HTMLButtonElement>("#browser-new");
+  buttons.forEach((button) => { button.disabled = true; });
+  setTerminalImageStatus("Opening a private Firefox window on the Forge display…");
+  try {
+    const response = await fetch(gateUrl("api/browser/sessions"), { method: "POST" });
+    const body = (await response.json()) as BrowserSessionInfo & { error?: string };
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    if (!response.ok || !Number.isSafeInteger(body.id)) {
+      throw new Error(body.error || "Could not open Firefox.");
+    }
+    await renderBrowser(body.id);
+  } catch (error) {
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not open Firefox.", true);
+    setDesktopState("BROWSER FAILED");
+    showDesktopMessage(error instanceof Error ? error.message : "Could not open Firefox.");
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+async function renderBrowser(id: number): Promise<void> {
+  disposeViews();
+  activeBrowserSessionId = id;
+  app.innerHTML = gateShell(`
+    <section class="workspace desktop-workspace browser-workspace">
+      <div class="workspace-bar">
+        <div>
+          <span class="eyebrow">HOME FIREFOX / PRIVATE PROFILE</span>
+          <h1>EutherBrowse</h1>
+        </div>
+        <div class="actions">
+          <button id="browser-new" class="ghost-button" type="button">OPEN BROWSER</button>
+          <span id="desktop-state" class="socket-state">FOCUSING</span>
+          <button id="desktop-keyboard" class="ghost-button primary-action" type="button">KEYBOARD</button>
+          <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
+        </div>
+      </div>
+      <div id="terminal-session-strip" class="terminal-session-strip" aria-label="Open terminal and browser sessions"></div>
+      <div class="desktop-frame browser-frame" id="desktop-frame" tabindex="0">
+        <video id="desktop-video" autoplay playsinline muted hidden></video>
+        <img id="desktop-fallback-image" alt="Home Firefox over authenticated HTTPS WebSocket" />
+        <div id="desktop-vnc" hidden></div>
+        <textarea id="desktop-mobile-input" class="desktop-mobile-input" rows="1" inputmode="text"
+          autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+          aria-label="Mobile keyboard input for home Firefox"></textarea>
+        <div class="desktop-touch-hint">TAP = CLICK · DRAG = POINTER · PINCH = ZOOM</div>
+        <button id="desktop-zoom-reset" class="desktop-zoom-reset" type="button" hidden>VIEW 100%</button>
+        <div class="desktop-empty" id="desktop-empty">
+          <span class="brand-mark large" aria-hidden="true"><i></i></span>
+          <strong>Connecting to home Firefox</strong>
+          <p>The OpenAI session and cookies remain on the Gate host.</p>
+        </div>
+        <div class="stream-hud">
+          <span id="desktop-output">FORGE / FIREFOX</span>
+          <span id="desktop-transport">JPEG / WSS INPUT</span>
+        </div>
+      </div>
+      <div class="desktop-footer browser-footer">
+        <span>Private Firefox profile · Click the stream to control · Esc returns locally.</span>
+        <span id="desktop-mode">1280×720 @ 30</span>
+      </div>
+    </section>`, "browser");
+
+  document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", createBrowserSession);
+  document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
+  document.querySelector<HTMLButtonElement>("#desktop-keyboard")?.addEventListener("click", focusDesktopKeyboard);
+  const zoomReset = document.querySelector<HTMLButtonElement>("#desktop-zoom-reset");
+  zoomReset?.addEventListener("pointerdown", (event) => event.stopPropagation());
+  zoomReset?.addEventListener("click", resetDesktopView);
+  bindCockpitNavigation();
+  installDesktopInput();
+  void refreshTerminalSessions();
+  terminalSessionRefreshTimer = window.setInterval(refreshTerminalSessions, 2500);
+
+  try {
+    const focusResponse = await fetch(gateUrl(`api/browser/sessions/${id}/focus`), { method: "POST" });
+    const session = (await focusResponse.json()) as BrowserSessionInfo & { error?: string };
+    if (focusResponse.status === 401) return renderLogin("Your gate session expired.");
+    if (!focusResponse.ok) throw new Error(session.error || "Firefox window no longer exists.");
+    const startResponse = await fetch(gateUrl("api/desktop/start?output=forge%3AHEADLESS-1"), { method: "POST" });
+    const start = (await startResponse.json()) as { error?: string };
+    if (!startResponse.ok) throw new Error(start.error || "Could not select the Forge display.");
+    const output = document.querySelector<HTMLElement>("#desktop-output");
+    if (output) output.textContent = `${browserSessionLabel(session.title)} / WS ${session.workspace}`;
+    connectFallbackDesktop();
+  } catch (error) {
+    setDesktopState("BROWSER FAILED");
+    showDesktopMessage(error instanceof Error ? error.message : "Could not connect to Firefox.");
   }
 }
 
