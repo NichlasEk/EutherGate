@@ -34,13 +34,12 @@ Swedish characters and password symbols when the client and Forge keyboard
 layouts differ. Navigation keys and explicit Ctrl/Alt/Meta shortcuts continue
 through the key-event path.
 
-The WSS/WebRTC input helper keeps one `wtype` text process alive for the viewer
-lifetime. Starting a fresh virtual keyboard and immediately typing dropped its
-first character before Sway had attached the device; because hardware input
-previously started one process per key, that could drop every printable
-character. The persistent process pays the attachment delay once. Standalone
-special-key invocations use the same 100 ms startup barrier already used by
-EutherBrowse URL navigation.
+The WSS/WebRTC input helper starts each `wtype` text command with the same 100 ms
+startup barrier already used by EutherBrowse URL navigation, then waits for the
+command to finish. `wtype -` was rejected after live measurement: it retained
+text until stdin reached EOF, which made typed content appear only when a viewer
+or session switch closed the helper. Consecutive queued text events are combined
+into bounded batches before the synchronous command.
 
 While an EutherBrowse stream is live, its hardware-keyboard listener remains
 active for the whole browser view. It does not depend on the stream wrapper
@@ -58,9 +57,8 @@ new visible framebuffer until its fullscreen surface is reconfigured. Direct
 `grim` hashes confirmed the capture itself remained byte-identical until a
 fullscreen disable/enable cycle. WSS input therefore schedules one such repaint
 80 ms after the first pending text or special-key event. Repaint requests are
-coalesced to at most roughly 12 per second. Text also schedules a trailing
-repaint 350 ms after the latest character because the persistent `wtype` process
-can return control before Firefox has applied its asynchronous text input.
+coalesced to at most roughly 12 per second. Because text injection now waits for
+`wtype` to finish, the repaint cannot race ahead of delivery to Firefox.
 
 ## Verification
 

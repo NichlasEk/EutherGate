@@ -131,34 +131,35 @@ class WssDesktopBridge:
             return
         deferred: dict | None = None
         repaint_due: float | None = None
-        repaint_followup_due: float | None = None
         try:
             while self.running.is_set():
                 try:
                     now = time.monotonic()
-                    repaint_ready = repaint_due is not None and now >= repaint_due
-                    followup_ready = (
-                        repaint_followup_due is not None
-                        and now >= repaint_followup_due
-                    )
-                    if repaint_ready or followup_ready:
-                        if repaint_ready:
-                            repaint_due = None
-                        if followup_ready:
-                            repaint_followup_due = None
+                    if repaint_due is not None and now >= repaint_due:
+                        repaint_due = None
                         controller.refresh_focused_window()
-                    deadlines = [
-                        deadline
-                        for deadline in (repaint_due, repaint_followup_due)
-                        if deadline is not None
-                    ]
                     timeout = (
                         0.5
-                        if not deadlines
-                        else max(0.001, min(0.5, min(deadlines) - time.monotonic()))
+                        if repaint_due is None
+                        else max(0.001, min(0.5, repaint_due - time.monotonic()))
                     )
                     event = deferred or self.input_events.get(timeout=timeout)
                     deferred = None
+                    if event.get("type") == "text":
+                        text_parts = [str(event.get("text", ""))]
+                        text_length = len(text_parts[0])
+                        while text_length < 512:
+                            try:
+                                following = self.input_events.get_nowait()
+                            except queue.Empty:
+                                break
+                            if following.get("type") != "text":
+                                deferred = following
+                                break
+                            part = str(following.get("text", ""))
+                            text_parts.append(part)
+                            text_length += len(part)
+                        event = {"type": "text", "text": "".join(text_parts)[:512]}
                     if event.get("type") in ("pointer_move", "pointer_delta"):
                         controller.update_pointer(event)
                         while True:
@@ -180,8 +181,6 @@ class WssDesktopBridge:
                         ):
                             if repaint_due is None:
                                 repaint_due = time.monotonic() + 0.08
-                            if event.get("type") == "text":
-                                repaint_followup_due = time.monotonic() + 0.35
                             self.emit_json(
                                 {"type": "input-ack", "input": event.get("type")}
                             )
