@@ -159,6 +159,7 @@ let proxiedSession = false;
 let clipboardPreviewUrl: string | null = null;
 let remoteClipboardBlob: Blob | null = null;
 const desktopTouches = new Map<number, DesktopTouchPoint>();
+const desktopPressedPointerButtons = new Map<number, Set<number>>();
 let desktopPinch: DesktopPinch | null = null;
 let desktopViewScale = 1;
 let desktopViewPanX = 0;
@@ -475,18 +476,22 @@ function renderTerminalSessionStrip(
     const active = session.id === activeBrowserSessionId;
     const label = browserSessionLabel(session.title);
     return `
-      <button class="terminal-session-chip browser-session-chip${active ? " is-active" : ""}"
-        type="button" data-browser-session="${session.id}" aria-pressed="${active}" title="${escapeHtml(session.title)}">
-        <span class="terminal-session-chip-top">
-          <i aria-hidden="true"></i>
-          <strong>${escapeHtml(label)}</strong>
-          <small>WS ${escapeHtml(session.workspace)}</small>
-        </span>
-        <span class="terminal-session-chip-detail">
-          <b>FIREFOX</b>
-          <em>HOME PROFILE</em>
-        </span>
-      </button>`;
+      <div class="browser-session-chip-shell">
+        <button class="terminal-session-chip browser-session-chip${active ? " is-active" : ""}"
+          type="button" data-browser-session="${session.id}" aria-pressed="${active}" title="${escapeHtml(session.title)}">
+          <span class="terminal-session-chip-top">
+            <i aria-hidden="true"></i>
+            <strong>${escapeHtml(label)}</strong>
+            <small>WS ${escapeHtml(session.workspace)}</small>
+          </span>
+          <span class="terminal-session-chip-detail">
+            <b>FIREFOX</b>
+            <em>HOME PROFILE</em>
+          </span>
+        </button>
+        <button class="browser-session-close" type="button" data-close-browser-session="${session.id}"
+          aria-label="Close ${escapeHtml(label)}" title="Close this Firefox window">&times;</button>
+      </div>`;
   }).join("");
   strip.innerHTML = terminalChips + browserChips;
   strip.querySelectorAll<HTMLButtonElement>("[data-terminal-session]").forEach((button) => {
@@ -496,6 +501,13 @@ function renderTerminalSessionStrip(
     button.addEventListener("click", () => {
       const id = Number(button.dataset.browserSession);
       if (Number.isSafeInteger(id)) void renderBrowser(id);
+    });
+  });
+  strip.querySelectorAll<HTMLButtonElement>("[data-close-browser-session]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const id = Number(button.dataset.closeBrowserSession);
+      if (Number.isSafeInteger(id)) void closeBrowserSession(id, button);
     });
   });
 }
@@ -645,6 +657,23 @@ async function closeActiveBrowserSession(): Promise<void> {
     setDesktopState("CLOSE FAILED");
     showDesktopMessage(error instanceof Error ? error.message : "Could not close Firefox window.");
     if (button) button.disabled = false;
+  }
+}
+
+async function closeBrowserSession(id: number, button: HTMLButtonElement): Promise<void> {
+  if (id === activeBrowserSessionId) {
+    await closeActiveBrowserSession();
+    return;
+  }
+  button.disabled = true;
+  try {
+    const response = await fetch(gateUrl(`api/browser/sessions/${id}`), { method: "DELETE" });
+    if (response.status === 401) return renderLogin("Your gate session expired.");
+    if (!response.ok) throw new Error(await responseError(response, "Could not close Firefox window."));
+    await refreshTerminalSessions();
+  } catch (error) {
+    button.disabled = false;
+    setTerminalImageStatus(error instanceof Error ? error.message : "Could not close Firefox window.", true);
   }
 }
 
@@ -1754,6 +1783,11 @@ function installDesktopInput(): void {
       desktopTouchStart(frame, event);
       return;
     }
+    try {
+      frame.setPointerCapture(event.pointerId);
+    } catch {
+      // The release fallback below still prevents a stuck remote button.
+    }
     const position = remotePositionFromClient(event.clientX, event.clientY);
     if (position) {
       sendDesktopInput({ type: "pointer_move", x: position.x, y: position.y });
@@ -1768,6 +1802,12 @@ function installDesktopInput(): void {
         });
       }
     }
+    let pressed = desktopPressedPointerButtons.get(event.pointerId);
+    if (!pressed) {
+      pressed = new Set<number>();
+      desktopPressedPointerButtons.set(event.pointerId, pressed);
+    }
+    pressed.add(event.button);
     sendDesktopInput({ type: "pointer_button", button: event.button, state: "pressed" });
   });
   frame.addEventListener("pointerup", (event) => {
@@ -1776,11 +1816,16 @@ function installDesktopInput(): void {
       desktopTouchEnd(frame, event, false);
       return;
     }
-    sendDesktopInput({ type: "pointer_button", button: event.button, state: "released" });
+    releaseDesktopPointerButton(frame, event.pointerId, event.button);
   });
   frame.addEventListener("pointercancel", (event) => {
-    if (event.pointerType === "touch") desktopTouchEnd(frame, event, true);
+    if (event.pointerType === "touch") {
+      desktopTouchEnd(frame, event, true);
+      return;
+    }
+    releaseDesktopPointerButtons(event.pointerId);
   });
+  frame.addEventListener("lostpointercapture", (event) => releaseDesktopPointerButtons(event.pointerId));
   frame.addEventListener("pointerleave", hideLocalBrowserCursor);
   frame.addEventListener("contextmenu", (event) => event.preventDefault());
   frame.addEventListener("wheel", (event) => {
@@ -1791,7 +1836,37 @@ function installDesktopInput(): void {
   window.addEventListener("keydown", desktopKeyEvent, { capture: true });
   window.addEventListener("keyup", desktopKeyEvent, { capture: true });
   window.addEventListener("blur", releaseDesktopSuperKey);
+  window.addEventListener("blur", releaseDesktopPointerButtonsOnBlur);
   document.addEventListener("pointerlockchange", desktopPointerLockChange);
+}
+
+function releaseDesktopPointerButton(frame: HTMLDivElement, pointerId: number, button: number): void {
+  const pressed = desktopPressedPointerButtons.get(pointerId);
+  if (pressed?.delete(button)) {
+    sendDesktopInput({ type: "pointer_button", button, state: "released" });
+  }
+  if (pressed && pressed.size === 0) desktopPressedPointerButtons.delete(pointerId);
+  if (!desktopPressedPointerButtons.has(pointerId)) {
+    try {
+      if (frame.hasPointerCapture(pointerId)) frame.releasePointerCapture(pointerId);
+    } catch {
+      // The pointer is already gone; the remote release was still sent.
+    }
+  }
+}
+
+function releaseDesktopPointerButtons(pointerId?: number): void {
+  for (const [activePointerId, buttons] of desktopPressedPointerButtons) {
+    if (pointerId !== undefined && activePointerId !== pointerId) continue;
+    for (const button of buttons) {
+      sendDesktopInput({ type: "pointer_button", button, state: "released" });
+    }
+    desktopPressedPointerButtons.delete(activePointerId);
+  }
+}
+
+function releaseDesktopPointerButtonsOnBlur(): void {
+  releaseDesktopPointerButtons();
 }
 
 function updateLocalBrowserCursor(frame: HTMLDivElement, event: PointerEvent): void {
@@ -2185,6 +2260,7 @@ function desktopPointerLockChange(): void {
 function releaseDesktopControl(exitPointerLock = true): void {
   if (!desktopControlActive) return;
   desktopControlActive = false;
+  releaseDesktopPointerButtons();
   if (desktopVideoReady) sendDesktopInput({ type: "release_control" });
   if (exitPointerLock && document.pointerLockElement) document.exitPointerLock();
   document.querySelector<HTMLDivElement>("#desktop-frame")?.blur();
@@ -2388,12 +2464,14 @@ function disposeDesktop(): void {
   window.removeEventListener("keyup", vncSuperKeyEvent, { capture: true });
   window.removeEventListener("blur", releaseVncSuperKey);
   releaseDesktopControl();
+  releaseDesktopPointerButtons();
   closeClipboardPanel();
   clearClipboardPreview();
   remoteClipboardBlob = null;
   window.removeEventListener("keydown", desktopKeyEvent, { capture: true });
   window.removeEventListener("keyup", desktopKeyEvent, { capture: true });
   window.removeEventListener("blur", releaseDesktopSuperKey);
+  window.removeEventListener("blur", releaseDesktopPointerButtonsOnBlur);
   document.removeEventListener("pointerlockchange", desktopPointerLockChange);
   if (desktopTouchReleaseTimers.size > 0) {
     for (const timer of desktopTouchReleaseTimers) window.clearTimeout(timer);

@@ -540,8 +540,43 @@ body {
 }
 
 .browser-session-chip {
+  width: 100%;
+  padding-right: 28px;
   border-color: rgba(92, 203, 190, .3);
   background: linear-gradient(145deg, rgba(10, 48, 43, .72), rgba(31, 18, 47, .92));
+}
+
+.browser-session-chip-shell {
+  position: relative;
+  flex: 0 0 auto;
+  min-width: 154px;
+  max-width: 230px;
+}
+
+.browser-session-close {
+  position: absolute;
+  z-index: 2;
+  top: 4px;
+  right: 5px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  place-items: center;
+  color: #769b94;
+  background: transparent;
+  font: 700 16px/1 sans-serif;
+}
+
+.browser-session-close:hover {
+  color: #fff3c0;
+  background: rgba(178, 91, 44, .32);
+}
+
+.browser-session-close:disabled {
+  opacity: .35;
 }
 
 .browser-session-chip .terminal-session-chip-top i {

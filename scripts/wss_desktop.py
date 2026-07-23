@@ -119,28 +119,31 @@ class WssDesktopBridge:
             self.emit_json({"type": "input-warning", "message": str(error)})
             return
         deferred: dict | None = None
-        while self.running.is_set():
-            try:
-                event = deferred or self.input_events.get(timeout=0.5)
-                deferred = None
-                if event.get("type") in ("pointer_move", "pointer_delta"):
-                    controller.update_pointer(event)
-                    while True:
-                        try:
-                            following = self.input_events.get_nowait()
-                        except queue.Empty:
-                            break
-                        if following.get("type") not in ("pointer_move", "pointer_delta"):
-                            deferred = following
-                            break
-                        controller.update_pointer(following)
-                    controller.flush_pointer()
-                else:
-                    controller.inject(event)
-            except queue.Empty:
-                continue
-            except Exception as error:
-                self.emit_json({"type": "input-warning", "message": str(error)})
+        try:
+            while self.running.is_set():
+                try:
+                    event = deferred or self.input_events.get(timeout=0.5)
+                    deferred = None
+                    if event.get("type") in ("pointer_move", "pointer_delta"):
+                        controller.update_pointer(event)
+                        while True:
+                            try:
+                                following = self.input_events.get_nowait()
+                            except queue.Empty:
+                                break
+                            if following.get("type") not in ("pointer_move", "pointer_delta"):
+                                deferred = following
+                                break
+                            controller.update_pointer(following)
+                        controller.flush_pointer()
+                    else:
+                        controller.inject(event)
+                except queue.Empty:
+                    continue
+                except Exception as error:
+                    self.emit_json({"type": "input-warning", "message": str(error)})
+        finally:
+            controller.close()
 
     def emit_json(self, message: dict) -> None:
         payload = json.dumps(message, separators=(",", ":")).encode()

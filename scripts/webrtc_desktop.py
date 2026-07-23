@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import gi
 
@@ -210,28 +211,31 @@ class DesktopBridge:
     def _input_loop(self) -> None:
         controller = InputController(self.backend, self.output, self.mode)
         deferred: dict | None = None
-        while self.running.is_set():
-            try:
-                event = deferred or self.input_events.get(timeout=0.5)
-                deferred = None
-                if event.get("type") in ("pointer_move", "pointer_delta"):
-                    controller.update_pointer(event)
-                    while True:
-                        try:
-                            following = self.input_events.get_nowait()
-                        except queue.Empty:
-                            break
-                        if following.get("type") not in ("pointer_move", "pointer_delta"):
-                            deferred = following
-                            break
-                        controller.update_pointer(following)
-                    controller.flush_pointer()
-                else:
-                    controller.inject(event)
-            except queue.Empty:
-                continue
-            except Exception as error:
-                emit({"type": "input-warning", "message": str(error)})
+        try:
+            while self.running.is_set():
+                try:
+                    event = deferred or self.input_events.get(timeout=0.5)
+                    deferred = None
+                    if event.get("type") in ("pointer_move", "pointer_delta"):
+                        controller.update_pointer(event)
+                        while True:
+                            try:
+                                following = self.input_events.get_nowait()
+                            except queue.Empty:
+                                break
+                            if following.get("type") not in ("pointer_move", "pointer_delta"):
+                                deferred = following
+                                break
+                            controller.update_pointer(following)
+                        controller.flush_pointer()
+                    else:
+                        controller.inject(event)
+                except queue.Empty:
+                    continue
+                except Exception as error:
+                    emit({"type": "input-warning", "message": str(error)})
+        finally:
+            controller.close()
 
     def _bus_loop(self) -> None:
         bus = self.pipeline.get_bus()
@@ -314,6 +318,21 @@ class InputController:
         self.return_position = cursor_position() if backend == "hyprland" else (0, 0)
         self.remote_x = mode.width / 2
         self.remote_y = mode.height / 2
+        self.pressed_buttons: set[int] = set()
+        self.virtual_pointer: subprocess.Popen[str] | None = None
+        if backend == "sway":
+            helper = Path(
+                os.environ.get(
+                    "EUTHERGATE_POINTER_HELPER",
+                    Path(__file__).resolve().parent.parent / "target/release/euthergate-pointer",
+                )
+            )
+            self.virtual_pointer = subprocess.Popen(
+                [helper],
+                stdin=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
 
     def inject(self, event: dict) -> None:
         kind = event.get("type")
@@ -325,6 +344,9 @@ class InputController:
                     str(self.return_position[0]),
                     str(self.return_position[1]),
                 )
+            elif self.backend == "sway":
+                self._send_pointer("release")
+                self.pressed_buttons.clear()
         elif kind == "pointer_move":
             self.update_pointer(event)
             self.flush_pointer()
@@ -337,18 +359,22 @@ class InputController:
                 if button:
                     run_hyprctl("dispatch", "sendshortcut", f",mouse:{button}")
             elif self.backend == "sway":
-                button = {0: "button1", 1: "button3", 2: "button2"}.get(int(event.get("button", 0)))
-                if button:
-                    state = "press" if event.get("state") == "pressed" else "release"
-                    run_swaymsg("seat", "seat0", "cursor", state, button)
+                button = int(event.get("button", 0))
+                if button in (0, 1, 2):
+                    if event.get("state") == "pressed" and button not in self.pressed_buttons:
+                        self._send_pointer(f"button {button} pressed")
+                        self.pressed_buttons.add(button)
+                    elif event.get("state") != "pressed" and button in self.pressed_buttons:
+                        self._send_pointer(f"button {button} released")
+                        self.pressed_buttons.remove(button)
         elif kind == "wheel":
             if self.backend == "hyprland":
                 key = "pagedown" if float(event.get("dy", 0)) > 0 else "pageup"
                 run_hyprctl("dispatch", "sendshortcut", f",{key}")
             else:
-                button = "button5" if float(event.get("dy", 0)) > 0 else "button4"
-                run_swaymsg("seat", "seat0", "cursor", "press", button)
-                run_swaymsg("seat", "seat0", "cursor", "release", button)
+                self._send_pointer(
+                    f"wheel {float(event.get('dx', 0))} {float(event.get('dy', 0))}"
+                )
         elif kind == "key" and event.get("state") == "pressed" and not event.get("repeat"):
             key = browser_key(event.get("code", ""))
             if not key:
@@ -389,7 +415,33 @@ class InputController:
         if self.backend == "hyprland":
             run_hyprctl("dispatch", "movecursor", str(x), str(y))
         else:
-            run_swaymsg("seat", "seat0", "cursor", "set", str(x), str(y))
+            self._send_pointer(
+                f"move {self.remote_x} {self.remote_y} {self.mode.width} {self.mode.height}"
+            )
+
+    def close(self) -> None:
+        if self.virtual_pointer is None:
+            return
+        try:
+            self._send_pointer("release")
+            self._send_pointer("stop")
+            if self.virtual_pointer.stdin:
+                self.virtual_pointer.stdin.close()
+            self.virtual_pointer.wait(timeout=1)
+        except (BrokenPipeError, subprocess.TimeoutExpired):
+            self.virtual_pointer.kill()
+        finally:
+            self.virtual_pointer = None
+            self.pressed_buttons.clear()
+
+    def _send_pointer(self, command: str) -> None:
+        if self.virtual_pointer is None or self.virtual_pointer.stdin is None:
+            raise RuntimeError("Forge virtual pointer is unavailable")
+        status = self.virtual_pointer.poll()
+        if status is not None:
+            raise RuntimeError(f"Forge virtual pointer exited with status {status}")
+        self.virtual_pointer.stdin.write(f"{command}\n")
+        self.virtual_pointer.stdin.flush()
 
 
 def cursor_position() -> tuple[int, int]:

@@ -3,6 +3,7 @@
 
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 
@@ -12,6 +13,9 @@ import websockets.sync.client
 HTTP_BASE = os.environ.get("EUTHERGATE_SMOKE_URL", "http://127.0.0.1:8787")
 TOKEN = os.environ.get("EUTHERGATE_TOKEN", "")
 OUTPUT = os.environ.get("EUTHERGATE_SMOKE_OUTPUT", "")
+CLICK = os.environ.get("EUTHERGATE_SMOKE_CLICK") == "1"
+POINTER_X = int(os.environ.get("EUTHERGATE_SMOKE_X", "100"))
+POINTER_Y = int(os.environ.get("EUTHERGATE_SMOKE_Y", "100"))
 
 
 def login() -> str:
@@ -55,19 +59,24 @@ def main() -> int:
             message = json.loads(payload)
             if message.get("type") == "ready":
                 ready = True
-            elif message.get("type") in {"error", "fatal"}:
+            elif message.get("type") in {"error", "fatal", "input-warning"}:
                 raise RuntimeError(message.get("message", "fallback helper failed"))
         elif payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9"):
             frame = payload
             break
-    socket.send(json.dumps({"type": "pointer_move", "x": 100, "y": 100}))
+    socket.send(json.dumps({"type": "pointer_move", "x": POINTER_X, "y": POINTER_Y}))
+    if CLICK:
+        socket.send(json.dumps({"type": "pointer_button", "button": 0, "state": "pressed"}))
+        time.sleep(0.05)
+        socket.send(json.dumps({"type": "pointer_button", "button": 0, "state": "released"}))
     socket.send(json.dumps({"type": "release_control"}))
     socket.close()
     if not ready:
         raise RuntimeError("HTTPS/WSS helper did not announce readiness")
     if not frame:
         raise RuntimeError("no complete JPEG desktop frame arrived")
-    print(f"ok: HTTPS/WSS JPEG frame received ({len(frame)} bytes), input socket writable")
+    input_result = "real pointer click sent" if CLICK else "input socket writable"
+    print(f"ok: HTTPS/WSS JPEG frame received ({len(frame)} bytes), {input_result}")
     return 0
 
 
