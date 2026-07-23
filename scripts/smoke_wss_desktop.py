@@ -82,6 +82,7 @@ def main() -> int:
                     break
         if not input_ack:
             raise RuntimeError("HTTPS/WSS helper did not acknowledge text input")
+        time.sleep(0.6)
     if CLICK:
         socket.send(json.dumps({"type": "pointer_button", "button": 0, "state": "pressed"}))
         time.sleep(0.05)

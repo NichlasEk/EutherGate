@@ -58,7 +58,9 @@ new visible framebuffer until its fullscreen surface is reconfigured. Direct
 `grim` hashes confirmed the capture itself remained byte-identical until a
 fullscreen disable/enable cycle. WSS input therefore schedules one such repaint
 80 ms after the first pending text or special-key event. Repaint requests are
-coalesced to at most roughly 12 per second.
+coalesced to at most roughly 12 per second. Text also schedules a trailing
+repaint 350 ms after the latest character because the persistent `wtype` process
+can return control before Firefox has applied its asynchronous text input.
 
 ## Verification
 
