@@ -398,6 +398,8 @@ class InputController:
             if not isinstance(text, str) or not text or len(text) > 512 or "\0" in text:
                 return
             run_wtype_text(text)
+        elif kind == "refresh":
+            self.refresh_focused_window()
 
     def update_pointer(self, event: dict) -> None:
         if event.get("type") == "pointer_move":

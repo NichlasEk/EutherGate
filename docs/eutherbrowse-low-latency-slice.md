@@ -52,6 +52,14 @@ Printable Windows desktop input is forwarded directly from `beforeinput.data`,
 the same event stage that already made Backspace reliable. It does not depend
 on a later textarea `input` event being emitted with a retained value.
 
+`PASTE IMAGE` reads PNG, JPEG or WebP from the client clipboard, writes it to the
+selected Forge Wayland clipboard through the existing authenticated 8 MiB
+bridge, then injects Ctrl+V into the already focused Firefox field. If direct
+Clipboard API access is blocked, the same button changes to `SELECT IMAGE` for
+an explicit local file choice. The payload is not added to the Firefox profile
+or Git; it remains owned by the Wayland clipboard until replaced. A delayed
+refresh makes asynchronously decoded image previews visible.
+
 Firefox on the headless pixman/Sway output can accept text without publishing a
 new visible framebuffer until its fullscreen surface is reconfigured. Direct
 `grim` hashes confirmed the capture itself remained byte-identical until a

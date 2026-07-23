@@ -700,10 +700,12 @@ async function renderBrowser(id: number): Promise<void> {
           <button id="browser-new" class="ghost-button" type="button">NEW WINDOW</button>
           <button id="browser-close" class="ghost-button" type="button">CLOSE WINDOW</button>
           <span id="desktop-state" class="socket-state">FOCUSING</span>
+          <button id="browser-paste-image" class="ghost-button" type="button">PASTE IMAGE</button>
           <button id="desktop-keyboard" class="ghost-button primary-action" type="button">KEYBOARD</button>
           <button id="show-terminal" class="ghost-button" type="button">TERMINAL</button>
         </div>
       </div>
+      <input id="browser-image-input" type="file" accept="image/png,image/jpeg,image/webp" hidden />
       <div id="terminal-session-strip" class="terminal-session-strip" aria-label="Open terminal and browser sessions"></div>
       <div class="desktop-frame browser-frame" id="desktop-frame" tabindex="0">
         <video id="desktop-video" autoplay playsinline muted hidden></video>
@@ -734,6 +736,8 @@ async function renderBrowser(id: number): Promise<void> {
 
   document.querySelector<HTMLButtonElement>("#browser-new")?.addEventListener("click", createBrowserSession);
   document.querySelector<HTMLButtonElement>("#browser-close")?.addEventListener("click", closeActiveBrowserSession);
+  document.querySelector<HTMLButtonElement>("#browser-paste-image")?.addEventListener("click", pasteImageIntoBrowser);
+  document.querySelector<HTMLInputElement>("#browser-image-input")?.addEventListener("change", selectBrowserImage);
   document.querySelector<HTMLButtonElement>("#show-terminal")?.addEventListener("click", renderTerminal);
   document.querySelector<HTMLButtonElement>("#desktop-keyboard")?.addEventListener("click", focusDesktopKeyboard);
   const zoomReset = document.querySelector<HTMLButtonElement>("#desktop-zoom-reset");
@@ -759,6 +763,91 @@ async function renderBrowser(id: number): Promise<void> {
   } catch (error) {
     setDesktopState("BROWSER FAILED");
     showDesktopMessage(error instanceof Error ? error.message : "Could not connect to Firefox.");
+  }
+}
+
+async function pasteImageIntoBrowser(event: Event): Promise<void> {
+  const button = event.currentTarget as HTMLButtonElement;
+  const picker = document.querySelector<HTMLInputElement>("#browser-image-input");
+  if (button.dataset.source === "file") {
+    picker?.click();
+    return;
+  }
+  if (!desktopVideoReady) {
+    setDesktopState("BROWSER NOT READY");
+    return;
+  }
+  button.disabled = true;
+  setDesktopState("READING LOCAL IMAGE");
+  try {
+    if (!navigator.clipboard.read) throw new Error("Clipboard image reading is unavailable.");
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const imageType = ["image/png", "image/jpeg", "image/webp"].find((type) => item.types.includes(type));
+      if (!imageType) continue;
+      await bridgeImageIntoBrowser(await item.getType(imageType), button);
+      return;
+    }
+    throw new Error("The local clipboard has no PNG, JPEG or WebP image.");
+  } catch {
+    button.dataset.source = "file";
+    button.textContent = "SELECT IMAGE";
+    setDesktopState("CLICK SELECT IMAGE");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function selectBrowserImage(event: Event): void {
+  const picker = event.currentTarget as HTMLInputElement;
+  const image = picker.files?.[0];
+  picker.value = "";
+  const button = document.querySelector<HTMLButtonElement>("#browser-paste-image");
+  if (!image || !button) return;
+  void bridgeImageIntoBrowser(image, button);
+}
+
+async function bridgeImageIntoBrowser(image: Blob, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  setDesktopState("SENDING IMAGE");
+  try {
+    const mime = image.type.split(";", 1)[0].toLowerCase();
+    if (!["image/png", "image/jpeg", "image/webp"].includes(mime)) {
+      throw new Error("Choose a PNG, JPEG or WebP image.");
+    }
+    await writeRemoteClipboard(image);
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    sendDesktopInput({
+      type: "key",
+      code: "KeyV",
+      state: "pressed",
+      repeat: false,
+      ctrl: true,
+      alt: false,
+      shift: false,
+      meta: false,
+    });
+    sendDesktopInput({
+      type: "key",
+      code: "KeyV",
+      state: "released",
+      repeat: false,
+      ctrl: true,
+      alt: false,
+      shift: false,
+      meta: false,
+    });
+    window.setTimeout(() => {
+      sendDesktopInput({ type: "refresh" });
+      setDesktopState("IMAGE PASTED");
+    }, 700);
+    button.dataset.source = "clipboard";
+    button.textContent = "PASTE IMAGE";
+  } catch (error) {
+    setDesktopState("IMAGE PASTE FAILED");
+    showDesktopMessage(error instanceof Error ? error.message : "Could not paste the image into Firefox.");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -1224,33 +1313,34 @@ function pasteClipboardToRemote(event: ClipboardEvent): void {
 }
 
 async function uploadClipboard(blob: Blob): Promise<void> {
-  if (!blob.size) {
-    setClipboardStatus("The local clipboard is empty.", true);
-    return;
-  }
-  if (blob.size > clipboardLimit) {
-    setClipboardStatus("Clipboard payload exceeds the 8 MiB limit.", true);
-    return;
-  }
-  const mime = blob.type.split(";", 1)[0].toLowerCase();
-  if (!["text/plain", "image/png", "image/jpeg", "image/webp"].includes(mime)) {
-    setClipboardStatus(`Unsupported clipboard type: ${mime || "unknown"}.`, true);
-    return;
-  }
   setClipboardStatus(`Sending ${clipboardDescription(blob)} to the selected Wayland session…`);
   try {
-    const response = await fetch(gateUrl("api/desktop/clipboard"), {
-      method: "POST",
-      headers: { "content-type": blob.type || mime },
-      body: blob,
-    });
-    if (!response.ok) throw new Error(await responseError(response, "Could not update remote clipboard."));
+    await writeRemoteClipboard(blob);
     remoteClipboardBlob = blob;
     await showClipboardPreview(blob);
     setClipboardStatus(`${clipboardDescription(blob)} is now on the remote clipboard.`);
   } catch (error) {
     setClipboardStatus(error instanceof Error ? error.message : "Could not update remote clipboard.", true);
   }
+}
+
+async function writeRemoteClipboard(blob: Blob): Promise<void> {
+  if (!blob.size) {
+    throw new Error("The local clipboard is empty.");
+  }
+  if (blob.size > clipboardLimit) {
+    throw new Error("Clipboard payload exceeds the 8 MiB limit.");
+  }
+  const mime = blob.type.split(";", 1)[0].toLowerCase();
+  if (!["text/plain", "image/png", "image/jpeg", "image/webp"].includes(mime)) {
+    throw new Error(`Unsupported clipboard type: ${mime || "unknown"}.`);
+  }
+  const response = await fetch(gateUrl("api/desktop/clipboard"), {
+    method: "POST",
+    headers: { "content-type": blob.type || mime },
+    body: blob,
+  });
+  if (!response.ok) throw new Error(await responseError(response, "Could not update remote clipboard."));
 }
 
 async function showClipboardPreview(blob: Blob): Promise<void> {
