@@ -139,19 +139,24 @@ fn handle_command(
                 .parse::<f64>()
                 .context("invalid horizontal wheel delta")?;
             let dy = dy.parse::<f64>().context("invalid vertical wheel delta")?;
+            if !dx.is_finite() || !dy.is_finite() {
+                return Err(anyhow!("wheel delta must be finite"));
+            }
             pointer.axis_source(wl_pointer::AxisSource::Wheel);
             if dx != 0.0 {
-                pointer.axis(
+                pointer.axis_discrete(
                     timestamp(started),
                     wl_pointer::Axis::HorizontalScroll,
                     dx / 12.0,
+                    wheel_steps(dx),
                 );
             }
             if dy != 0.0 {
-                pointer.axis(
+                pointer.axis_discrete(
                     timestamp(started),
                     wl_pointer::Axis::VerticalScroll,
                     dy / 12.0,
+                    wheel_steps(dy),
                 );
             }
             pointer.frame();
@@ -210,5 +215,29 @@ fn parse_button(value: &str) -> Result<u32> {
         "1" => Ok(BTN_MIDDLE),
         "2" => Ok(BTN_RIGHT),
         _ => Err(anyhow!("unsupported pointer button")),
+    }
+}
+
+fn wheel_steps(delta: f64) -> i32 {
+    let magnitude = (delta.abs() / 100.0).round().clamp(1.0, 12.0) as i32;
+    if delta.is_sign_negative() {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_steps;
+
+    #[test]
+    fn wheel_steps_keep_direction_and_bound_large_deltas() {
+        assert_eq!(wheel_steps(100.0), 1);
+        assert_eq!(wheel_steps(-100.0), -1);
+        assert_eq!(wheel_steps(1.0), 1);
+        assert_eq!(wheel_steps(-1.0), -1);
+        assert_eq!(wheel_steps(350.0), 4);
+        assert_eq!(wheel_steps(10_000.0), 12);
     }
 }

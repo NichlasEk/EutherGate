@@ -84,6 +84,12 @@ environment. An isolated profile was verified through `about:support` as
 `Compositing: WebRender (Software)` before enabling it for the persistent
 profile.
 
+Mouse-wheel input uses Wayland's discrete wheel request, which carries both the
+continuous axis value and a physical wheel step. Firefox can ignore a plain
+continuous axis event when the source is declared as a physical wheel; the
+discrete step preserves the Windows wheel direction and makes both chat-history
+directions actionable.
+
 ## Verification
 
 The lifecycle smoke test now proves that a second JPEG cannot arrive before the
