@@ -320,6 +320,7 @@ class InputController:
         self.remote_y = mode.height / 2
         self.pressed_buttons: set[int] = set()
         self.virtual_pointer: subprocess.Popen[str] | None = None
+        self.virtual_keyboard = self._start_virtual_keyboard()
         if backend == "sway":
             helper = Path(
                 os.environ.get(
@@ -397,7 +398,7 @@ class InputController:
             text = event.get("text")
             if not isinstance(text, str) or not text or len(text) > 512 or "\0" in text:
                 return
-            run_wtype_text(text)
+            self._send_text(text)
 
     def update_pointer(self, event: dict) -> None:
         if event.get("type") == "pointer_move":
@@ -420,19 +421,49 @@ class InputController:
             )
 
     def close(self) -> None:
-        if self.virtual_pointer is None:
-            return
+        if self.virtual_pointer is not None:
+            try:
+                self._send_pointer("release")
+                self._send_pointer("stop")
+                if self.virtual_pointer.stdin:
+                    self.virtual_pointer.stdin.close()
+                self.virtual_pointer.wait(timeout=1)
+            except (BrokenPipeError, subprocess.TimeoutExpired):
+                self.virtual_pointer.kill()
+            finally:
+                self.virtual_pointer = None
+                self.pressed_buttons.clear()
         try:
-            self._send_pointer("release")
-            self._send_pointer("stop")
-            if self.virtual_pointer.stdin:
-                self.virtual_pointer.stdin.close()
-            self.virtual_pointer.wait(timeout=1)
+            if self.virtual_keyboard.stdin:
+                self.virtual_keyboard.stdin.close()
+            self.virtual_keyboard.wait(timeout=1)
         except (BrokenPipeError, subprocess.TimeoutExpired):
-            self.virtual_pointer.kill()
-        finally:
-            self.virtual_pointer = None
-            self.pressed_buttons.clear()
+            self.virtual_keyboard.kill()
+
+    def _start_virtual_keyboard(self) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            ["wtype", "-s", "100", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+    def _send_text(self, text: str) -> None:
+        if self.virtual_keyboard.poll() is not None:
+            self.virtual_keyboard = self._start_virtual_keyboard()
+        if self.virtual_keyboard.stdin is None:
+            raise RuntimeError("Forge virtual keyboard is unavailable")
+        try:
+            self.virtual_keyboard.stdin.write(text)
+            self.virtual_keyboard.stdin.flush()
+        except BrokenPipeError:
+            self.virtual_keyboard = self._start_virtual_keyboard()
+            if self.virtual_keyboard.stdin is None:
+                raise RuntimeError("Forge virtual keyboard is unavailable")
+            self.virtual_keyboard.stdin.write(text)
+            self.virtual_keyboard.stdin.flush()
 
     def _send_pointer(self, command: str) -> None:
         if self.virtual_pointer is None or self.virtual_pointer.stdin is None:
@@ -515,24 +546,13 @@ def run_swaymsg(*args: str) -> None:
 
 def run_wtype(key: str, modifiers: list[str]) -> None:
     modifier_names = {"CTRL": "ctrl", "ALT": "alt", "SHIFT": "shift", "SUPER": "logo"}
-    command = ["wtype"]
+    command = ["wtype", "-s", "100"]
     for modifier in modifiers:
         command.extend(["-M", modifier_names[modifier]])
     command.extend(["-k", sway_key(key)])
     for modifier in reversed(modifiers):
         command.extend(["-m", modifier_names[modifier]])
     subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1)
-
-
-def run_wtype_text(text: str) -> None:
-    subprocess.run(
-        ["wtype", "--", text],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        timeout=2,
-    )
-
 
 def sway_key(key: str) -> str:
     mapping = {

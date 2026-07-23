@@ -2137,6 +2137,14 @@ function desktopKeyEvent(event: KeyboardEvent): void {
     if (event.type === "keydown") releaseDesktopControl();
     return;
   }
+  const altGraphText = event.getModifierState("AltGraph") || (event.ctrlKey && event.altKey);
+  const printableText = event.key.length === 1
+    && !event.metaKey
+    && ((!event.ctrlKey && !event.altKey) || altGraphText);
+  if (!desktopVncActive && printableText) {
+    if (event.type === "keydown" && !event.isComposing) sendDesktopText(event.key);
+    return;
+  }
   if (desktopVncActive) {
     sendVncKeyboardEvent(event);
     return;

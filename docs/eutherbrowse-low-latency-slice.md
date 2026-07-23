@@ -25,6 +25,23 @@ This deliberately keeps the existing JPEG/WSS transport. It removes stale-frame
 backlog and duplicate cursor lag without introducing a new codec or changing
 Firefox session ownership.
 
+## Keyboard follow-up
+
+Hardware keyboard input in EutherBrowse sends printable characters as the
+character produced by the local browser rather than reconstructing them from
+the physical `KeyboardEvent.code`. This preserves `@`, shifted punctuation,
+Swedish characters and password symbols when the client and Forge keyboard
+layouts differ. Navigation keys and explicit Ctrl/Alt/Meta shortcuts continue
+through the key-event path.
+
+The WSS/WebRTC input helper keeps one `wtype` text process alive for the viewer
+lifetime. Starting a fresh virtual keyboard and immediately typing dropped its
+first character before Sway had attached the device; because hardware input
+previously started one process per key, that could drop every printable
+character. The persistent process pays the attachment delay once. Standalone
+special-key invocations use the same 100 ms startup barrier already used by
+EutherBrowse URL navigation.
+
 ## Verification
 
 The lifecycle smoke test now proves that a second JPEG cannot arrive before the
@@ -40,4 +57,3 @@ cd web && npm run build
 cargo test
 cargo build --release
 ```
-
