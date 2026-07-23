@@ -2192,6 +2192,16 @@ function flushDesktopMobileInput(): void {
 }
 
 function desktopMobileBeforeInput(event: InputEvent): void {
+  if (
+    (event.inputType === "insertText"
+      || event.inputType === "insertReplacementText"
+      || event.inputType === "insertFromComposition")
+    && event.data
+  ) {
+    event.preventDefault();
+    sendDesktopText(event.data);
+    return;
+  }
   const code = {
     deleteContentBackward: "Backspace",
     deleteContentForward: "Delete",

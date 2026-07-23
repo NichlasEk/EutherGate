@@ -130,10 +130,20 @@ class WssDesktopBridge:
             self.emit_json({"type": "input-warning", "message": str(error)})
             return
         deferred: dict | None = None
+        repaint_due: float | None = None
         try:
             while self.running.is_set():
                 try:
-                    event = deferred or self.input_events.get(timeout=0.5)
+                    now = time.monotonic()
+                    if repaint_due is not None and now >= repaint_due:
+                        repaint_due = None
+                        controller.refresh_focused_window()
+                    timeout = (
+                        0.5
+                        if repaint_due is None
+                        else max(0.001, min(0.5, repaint_due - time.monotonic()))
+                    )
+                    event = deferred or self.input_events.get(timeout=timeout)
                     deferred = None
                     if event.get("type") in ("pointer_move", "pointer_delta"):
                         controller.update_pointer(event)
@@ -154,6 +164,8 @@ class WssDesktopBridge:
                             and event.get("state") == "pressed"
                             and not event.get("repeat")
                         ):
+                            if repaint_due is None:
+                                repaint_due = time.monotonic() + 0.08
                             self.emit_json(
                                 {"type": "input-ack", "input": event.get("type")}
                             )

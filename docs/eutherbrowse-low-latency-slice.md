@@ -49,6 +49,16 @@ The `KEYBOARD` action also exposes a small `TYPE HERE → FIREFOX` field that us
 ordinary browser input events as an explicit fallback. Gate acknowledges only
 the input event type, never its text; the UI shows `KEYBOARD ACTIVE` without
 logging an email address or password.
+Printable Windows desktop input is forwarded directly from `beforeinput.data`,
+the same event stage that already made Backspace reliable. It does not depend
+on a later textarea `input` event being emitted with a retained value.
+
+Firefox on the headless pixman/Sway output can accept text without publishing a
+new visible framebuffer until its fullscreen surface is reconfigured. Direct
+`grim` hashes confirmed the capture itself remained byte-identical until a
+fullscreen disable/enable cycle. WSS input therefore schedules one such repaint
+80 ms after the first pending text or special-key event. Repaint requests are
+coalesced to at most roughly 12 per second.
 
 ## Verification
 

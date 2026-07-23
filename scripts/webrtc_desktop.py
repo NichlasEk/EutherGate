@@ -420,6 +420,12 @@ class InputController:
                 f"move {self.remote_x} {self.remote_y} {self.mode.width} {self.mode.height}"
             )
 
+    def refresh_focused_window(self) -> None:
+        if self.backend != "sway":
+            return
+        run_swaymsg("fullscreen", "disable")
+        run_swaymsg("fullscreen", "enable")
+
     def close(self) -> None:
         if self.virtual_pointer is not None:
             try:
